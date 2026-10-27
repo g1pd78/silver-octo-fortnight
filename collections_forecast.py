@@ -26,9 +26,11 @@
      × уровень выполнения, очищенный от календаря и сглаженный по прошлым месяцам. Нужен потому, что признак
      «выполнение прошлого месяца» путает календарь с уровнем: предоплата в апреле перед майскими праздниками
      поднимает прогноз мая. Берётся (сам или в смеси), только если в бэктесте точнее.
-  9. Полный набор на любой месяц (TARGET_MONTHS): прошлый, текущий или будущий — таблица по каждому дню:
-     план, факт, прогноз модели без факта месяца, итоговый прогноз с учётом факта, накопленные суммы,
-     % выполнения плана, recovery rate на дату.
+  9. Полный набор на любой месяц (TARGET_MONTHS): прошлый, текущий или будущий — таблица по каждому дню.
+     forecast            — прогноз на КАЖДЫЙ день месяца; факт этого месяца в него не попадает никогда
+                           (для текущего месяца — прогноз, сделанный 1-го числа). По нему — проверка по факту.
+     fact_plus_forecast  — факт, где он есть, + прогноз остатка с поправкой по факту на сегодня: куда придёт месяц.
+     Для обоих — накопленные суммы, эффективность на дату (eff_*_pct), разница с фактом (eff_diff_pp), recovery rate.
 
 Вход: DataFrame с колонками дата / факт / план [/ долг] — значения ЗА ДЕНЬ.
 Будущие даты не нужны. Если план месяца не загружен, оставьте его пустым или не выгружайте эти даты.
@@ -743,42 +745,56 @@ def production(d, mt, cur, targets, use_debt, best, evals, rr_evals, winner, L, 
             if rr is not None:
                 rr.loc[T] = cum[-1] / mt.loc[T, "debt_m"]
 
+        has_fact = np.arange(len(a)) < k
+        cum_plan, cum_p = np.cumsum(rows["plan"].to_numpy()), np.cumsum(p)
         out_rows = pd.DataFrame({
             "month": str(T), "date": rows["date"].to_numpy(), "is_workday": rows["is_workday"].to_numpy(),
+            "has_fact": has_fact,                                   # True — по этому дню факт уже есть
             "plan": rows["plan"].to_numpy(), "plan_is_forecast": rows["plan_actual"].isna().to_numpy(),
-            "fact": a, "model_forecast": p, "forecast": fc, "is_forecast": np.arange(len(a)) >= k,
-            "cum_plan": np.cumsum(rows["plan"].to_numpy()), "cum_fact": np.where(np.isnan(a), np.nan, np.nancumsum(a)),
-            "cum_model_forecast": np.cumsum(p), "cum_forecast": cum})
+            "fact": a,
+            "forecast": p,                  # прогноз на КАЖДЫЙ день месяца, без единого факта этого месяца
+            "fact_plus_forecast": fc,       # факт, где он есть, + прогноз остатка с поправкой по факту на сегодня
+            "cum_plan": cum_plan,
+            "cum_fact": np.where(has_fact, np.cumsum(np.nan_to_num(a)), np.nan),
+            "cum_forecast": cum_p,
+            "cum_fact_plus_forecast": cum})
         cp = out_rows["cum_plan"].replace(0, np.nan)
-        out_rows["completion_pct"] = 100 * out_rows["cum_forecast"] / cp           # эффективность: факт, где есть, + прогноз
-        out_rows["eff_fact_pct"] = 100 * out_rows["cum_fact"] / cp                 # эффективность факта на дату
-        out_rows["eff_model_pct"] = 100 * out_rows["cum_model_forecast"] / cp      # эффективность прогноза без факта месяца
-        out_rows["eff_diff_pp"] = out_rows["eff_model_pct"] - out_rows["eff_fact_pct"]  # проверка по факту, п.п.
-        out_rows["model_err_pct"] = 100 * (out_rows["cum_model_forecast"] / out_rows["cum_fact"] - 1)
+        out_rows["eff_fact_pct"] = 100 * out_rows["cum_fact"] / cp                      # эффективность факта на дату
+        out_rows["eff_forecast_pct"] = 100 * out_rows["cum_forecast"] / cp              # эффективность прогноза на дату
+        out_rows["eff_fact_plus_forecast_pct"] = 100 * out_rows["cum_fact_plus_forecast"] / cp  # куда придёт месяц
+        out_rows["eff_diff_pp"] = out_rows["eff_forecast_pct"] - out_rows["eff_fact_pct"]       # проверка по факту, п.п.
+        out_rows["forecast_err_pct"] = 100 * (out_rows["cum_forecast"] / out_rows["cum_fact"] - 1)
 
-        eff = 100 * cum[-1] / plan_m
+        eff, eff_pure = 100 * cum[-1] / plan_m, 100 * cum_p[-1] / plan_m
         e = evals[sc][winner]
         e = e.loc[e["known_days"] == min(k, e["known_days"].max()), "err_eff_pp"] if k < len(a) else pd.Series(dtype=float)
         lo, hi = (eff - e.quantile(0.9), eff - e.quantile(0.1)) if len(e) >= 5 else (np.nan, np.nan)
         s = {"месяц": str(T), "дней факта": f"{k} из {len(a)}",
              "план": f"{plan_m:,.0f}".replace(",", " ") + (" (прогноз)" if sc else ""),
-             "прогноз факта": f"{cum[-1]:,.0f}".replace(",", " "),
-             "эффективность": f"{eff:.1f}%",
-             "80% интервал эффективности": (f"{lo:.1f}% – {hi:.1f}%" if np.isfinite(lo) else "—")}
+             "эфф.: прогноз без факта": f"{eff_pure:.1f}%",
+             "эфф.: факт + прогноз остатка": f"{eff:.1f}%",
+             "80% интервал": (f"{lo:.1f}% – {hi:.1f}%" if np.isfinite(lo) else "—"),
+             "сумма: факт + прогноз остатка": f"{cum[-1]:,.0f}".replace(",", " "),
+             "разница прогноза с фактом на сегодня": (f"{out_rows['eff_diff_pp'].iloc[k - 1]:+.2f} п.п." if k else "—")}
 
         if "debt" in d:
             debt = rows["debt"].to_numpy()
             hist = (d["date"] < rows["date"].iloc[0]).to_numpy()
             f_before, d_before = series[hist].sum(), d.loc[hist, "debt"].sum()
-            out_rows["debt"] = debt
-            out_rows["debt_is_forecast"] = rows["debt_actual"].isna().to_numpy()
-            out_rows["rr_day_pct"] = 100 * fc / debt
             cum_debt = np.cumsum(debt) if RR_DENOM == "sum" else debt
             tot_debt = d_before + np.cumsum(debt) if RR_DENOM == "sum" else debt
-            out_rows["rr_cum_month_pct"] = 100 * cum / cum_debt
-            out_rows["rr_cum_total_pct"] = 100 * (f_before + cum) / tot_debt
-            rr_m = cum[-1] / cum_debt[-1]
-            s["recovery месяца"] = f"{100 * rr_m:.3f}%" + (" (долг — прогноз)" if out_rows["debt_is_forecast"].any() else "")
+            out_rows["debt"] = debt
+            out_rows["debt_is_forecast"] = rows["debt_actual"].isna().to_numpy()
+            out_rows["rr_day_fact_pct"] = 100 * a / debt                                   # за день: факт / долг
+            out_rows["rr_day_forecast_pct"] = 100 * p / debt                               # за день: прогноз / долг
+            out_rows["rr_fact_pct"] = 100 * out_rows["cum_fact"] / cum_debt                # с начала месяца
+            out_rows["rr_forecast_pct"] = 100 * cum_p / cum_debt
+            out_rows["rr_fact_plus_forecast_pct"] = 100 * cum / cum_debt
+            out_rows["rr_total_pct"] = 100 * (f_before + cum) / tot_debt                  # с начала данных
+            rr_m, rr_pure = cum[-1] / cum_debt[-1], cum_p[-1] / cum_debt[-1]
+            note = " (долг — прогноз)" if out_rows["debt_is_forecast"].any() else ""
+            s["recovery: прогноз без факта"] = f"{100 * rr_pure:.3f}%"
+            s["recovery: факт + прогноз остатка"] = f"{100 * rr_m:.3f}%" + note
             re = rr_evals[sc][winner]
             re = re.loc[re["known_days"] == min(k, re["known_days"].max()), "err_rr"] if k < len(a) else pd.Series(dtype=float)
             s["80% интервал recovery"] = "—"
@@ -828,29 +844,38 @@ def plot_backtest(curves: dict, path: str):
 
 
 def plot_month(g: pd.DataFrame, path: str):
-    """Выполнение плана на дату и (если есть долг) recovery rate на дату: факт — сплошная, прогноз — пунктир."""
+    """Эффективность на дату (и recovery rate, если есть долг): факт; прогноз на весь месяц без факта
+    с коридором ±1 п.п. (цель); куда придёт месяц с учётом факта по сегодня."""
     import matplotlib.dates as mdates
     import matplotlib.pyplot as plt
-    panels = [("completion_pct", "Выполнение плана на дату, %")]
-    if "rr_cum_month_pct" in g:
-        panels.append(("rr_cum_month_pct", "Recovery rate с начала месяца, %"))
-    fig, axes = plt.subplots(1, len(panels), figsize=(5.5 * len(panels), 4.2), facecolor=SURFACE)
+    panels = [("eff", "Эффективность на дату, %", True)]
+    if "rr_fact_pct" in g:
+        panels.append(("rr", "Recovery rate с начала месяца, %", False))
+    cols = {"eff": ("eff_fact_pct", "eff_forecast_pct", "eff_fact_plus_forecast_pct"),
+            "rr": ("rr_fact_pct", "rr_forecast_pct", "rr_fact_plus_forecast_pct")}
+    fig, axes = plt.subplots(1, len(panels), figsize=(6.5 * len(panels), 4.5), facecolor=SURFACE)
     axes = np.atleast_1d(axes)
-    known = g[~g["is_forecast"]]
-    fut = g[g["is_forecast"]]
-    if len(known) and len(fut):
-        fut = pd.concat([known.tail(1), fut])
-    for ax, (col, title) in zip(axes, panels):
+    known, rest = g[g["has_fact"]], g[~g["has_fact"]]
+    for ax, (key, title, band) in zip(axes, panels):
+        c_fact, c_fc, c_fpf = cols[key]
         _style(ax)
+        if band:
+            ax.fill_between(g["date"], g[c_fc] - 1, g[c_fc] + 1, color=BLUE, alpha=0.15, linewidth=0,
+                            label="±1 п.п. от прогноза (цель)")
+        ax.plot(g["date"], g[c_fc], color=BLUE, linewidth=2, linestyle=(0, (4, 3)), label="Прогноз (без факта месяца)")
         if len(known):
-            ax.plot(known["date"], known[col], color=INK, linewidth=2, label="Факт")
-        if len(fut):
-            ax.plot(fut["date"], fut[col], color=BLUE, linewidth=2, linestyle=(0, (4, 3)), label="Прогноз")
+            ax.plot(known["date"], known[c_fact], color=INK, linewidth=2, label="Факт")
+        if len(rest):
+            r = pd.concat([known.tail(1), rest]) if len(known) else rest
+            ax.plot(r["date"], r[c_fpf], color=ORANGE, linewidth=2, linestyle=(0, (1, 1.5)),
+                    label="Факт + прогноз остатка")
+        if key == "eff":
+            ax.axhline(100, color=INK2, linewidth=1, linestyle=(0, (1, 2)))
         ax.set_xlim(g["date"].min() - pd.Timedelta(hours=12), g["date"].max() + pd.Timedelta(hours=12))
         ax.xaxis.set_major_locator(mdates.DayLocator(bymonthday=[1, 8, 15, 22, 29]))
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m"))
         ax.set_title(f"{g['month'].iloc[0]}: {title}", color=INK, loc="left", fontsize=11)
-        ax.legend(frameon=False, fontsize=9, labelcolor=INK2)
+        ax.legend(frameon=False, fontsize=8, labelcolor=INK2, loc="lower right")
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
