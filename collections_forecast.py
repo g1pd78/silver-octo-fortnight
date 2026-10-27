@@ -1,6 +1,13 @@
 """
 Прогноз сборов (факт против плана) на любой месяц — по каждому дню, с выполнением плана и recovery rate.
 
+ГЛАВНАЯ МЕТРИКА
+  Эффективность = факт / план и прогноз / план. Цель — разница между ними не больше 1 п.п.
+  Бэктест, подбор параметров и отчёт считаются по этой разнице: на конец месяца (в зависимости от того,
+  сколько дней месяца уже известно) и на каждую дату месяца (накопленный прогноз / накопленный план против
+  накопленного факта / накопленного плана). Если план ещё не загружен, эффективность прогноза считается
+  к спрогнозированному плану.
+
 ЛОГИКА (как в первой версии)
   1. Календарные признаки по производственному календарю РФ 2024–2027.
   2. Градиентный бустинг предсказывает, какую долю МЕСЯЧНОГО плана соберут в каждый день.
@@ -513,6 +520,12 @@ def eom_errors(actual: np.ndarray, pred: np.ndarray, alphas) -> np.ndarray:
     return eom_forecasts(actual, pred, alphas) / actual.sum() - 1
 
 
+def eom_eff_errors(actual: np.ndarray, pred: np.ndarray, plan_used: float, plan_true: float, alphas) -> np.ndarray:
+    """Разница эффективности на конец месяца [alpha, known_days], п.п.:
+    прогноз / план (загруженный или спрогнозированный, если план ещё не загружен) − факт / план."""
+    return 100 * (eom_forecasts(actual, pred, alphas) / plan_used - actual.sum() / plan_true)
+
+
 # ============================================================================
 # УРОВЕНЬ ДЛЯ «БУСТИНГ × УРОВЕНЬ»
 # ============================================================================
@@ -577,6 +590,7 @@ def backtest(d: pd.DataFrame, mt: pd.DataFrame, plan_cfg: dict, debt_cfg: dict =
         pu = plan_unknown_rows(d, mt, m, plan_cfg, has_debt)    # тот же месяц, если его план ещё не загружен
         plan_m, plan_hat = te["plan_m"].iloc[0], pu["plan_m"].iloc[0]
         te["plan_m_hat"] = plan_hat
+        te["plan_hat"] = pu["plan"].to_numpy()
         for tag, fl in feats.items():
             model = fit_model(train, m, fl)
             te[f"pred_model{tag}"] = predict_share(model, te) * plan_m
@@ -601,6 +615,11 @@ def add_level_method(bt: pd.DataFrame, lvl_cfg: dict, L: pd.Series) -> pd.DataFr
     return bt
 
 
+def _plan_used(g, sfx):
+    """План по дням, к которому считается эффективность прогноза: загруженный или спрогнозированный."""
+    return g["plan_hat"].to_numpy() if sfx == "_pu" else g["plan"].to_numpy()
+
+
 def _blend(g, w, sfx):
     """w = (вес бустинга, вес «бустинг × уровень», вес референсных месяцев)."""
     return (w[0] * g[f"pred_model{sfx}"].to_numpy() + w[1] * g[f"pred_cal{sfx}"].to_numpy()
@@ -608,14 +627,15 @@ def _blend(g, w, sfx):
 
 
 def tune(bt: pd.DataFrame, sfx: str = ""):
-    """Подбор весов и силы коррекции по средней |ошибке итога месяца| по всем дням месяца."""
+    """Подбор весов и силы коррекции по средней |разнице эффективности на конец месяца| (п.п.) по всем дням месяца."""
     results = {}
     candidates = {M_REF: [(0, 0, 1)], M_BOOST: [(1, 0, 0)], M_CAL: [(0, 1, 0)],
                   M_MIX: [w for w in MIX_GRID if max(w) < 1]}
     for name, weights in candidates.items():
         best = None
         for w in weights:
-            errs = [np.abs(eom_errors(g["fact"].to_numpy(), _blend(g, w, sfx), ALPHAS)).mean(axis=1)
+            errs = [np.abs(eom_eff_errors(g["fact"].to_numpy(), _blend(g, w, sfx), _plan_used(g, sfx).sum(),
+                                          g["plan"].sum(), ALPHAS)).mean(axis=1)
                     for _, g in bt.groupby("ym")]
             score = np.mean(errs, axis=0)  # по alpha
             j = int(np.argmin(score))
@@ -626,18 +646,31 @@ def tune(bt: pd.DataFrame, sfx: str = ""):
 
 
 def evaluate(bt: pd.DataFrame, w, alpha: float, sfx: str = "") -> pd.DataFrame:
+    """Для каждого месяца и числа известных дней k: разница эффективности прогноза и факта, п.п. —
+    на конец месяца и в среднем по датам после k (накопленный прогноз / накопленный план против
+    накопленного факта / накопленного плана)."""
     rows = []
     for m, g in bt.groupby("ym"):
         a = g["fact"].to_numpy()
         p = _blend(g, w, sfx)
+        cp_true, cp_used = np.cumsum(g["plan"].to_numpy()), np.cumsum(_plan_used(g, sfx))
         ca = np.cumsum(a)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            eff_fact = ca / cp_true
         for k in range(len(a)):
             path = nowcast_path(a, p, k, alpha)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                diff = 100 * (path / cp_used[k:] - eff_fact[k:])
+            diff = diff[np.isfinite(diff)]
             mask = ca[k:] > 0
             rows.append(dict(
                 ym=str(m), known_days=k,
-                err_eom=path[-1] / ca[-1] - 1,                                   # ошибка итога месяца
-                err_path=np.mean(np.abs(path[mask] / ca[k:][mask] - 1)),         # ошибка накопл. факта на даты
+                eff_fact=100 * ca[-1] / cp_true[-1],                              # эффективность факта на конец месяца, %
+                err_eff_pp=100 * path[-1] / cp_used[-1] - 100 * ca[-1] / cp_true[-1],   # разница на конец месяца, п.п.
+                eff_dates_pp=np.mean(np.abs(diff)) if len(diff) else np.nan,      # ср. |разница| на датах после k, п.п.
+                eff_dates_within1=np.mean(np.abs(diff) <= 1) if len(diff) else np.nan,
+                err_eom=path[-1] / ca[-1] - 1,                                    # относительная ошибка суммы
+                err_path=np.mean(np.abs(path[mask] / ca[k:][mask] - 1)),
                 err_daily_wape=np.abs(p[k:] - a[k:]).sum() / max(a[k:].sum(), 1e-9)))
     return pd.DataFrame(rows)
 
@@ -716,17 +749,22 @@ def production(d, mt, cur, targets, use_debt, best, evals, rr_evals, winner, L, 
             "fact": a, "model_forecast": p, "forecast": fc, "is_forecast": np.arange(len(a)) >= k,
             "cum_plan": np.cumsum(rows["plan"].to_numpy()), "cum_fact": np.where(np.isnan(a), np.nan, np.nancumsum(a)),
             "cum_model_forecast": np.cumsum(p), "cum_forecast": cum})
-        out_rows["completion_pct"] = 100 * out_rows["cum_forecast"] / out_rows["cum_plan"].replace(0, np.nan)
-        out_rows["model_err_pct"] = 100 * (out_rows["cum_model_forecast"] / out_rows["cum_fact"] - 1)  # проверка по факту
+        cp = out_rows["cum_plan"].replace(0, np.nan)
+        out_rows["completion_pct"] = 100 * out_rows["cum_forecast"] / cp           # эффективность: факт, где есть, + прогноз
+        out_rows["eff_fact_pct"] = 100 * out_rows["cum_fact"] / cp                 # эффективность факта на дату
+        out_rows["eff_model_pct"] = 100 * out_rows["cum_model_forecast"] / cp      # эффективность прогноза без факта месяца
+        out_rows["eff_diff_pp"] = out_rows["eff_model_pct"] - out_rows["eff_fact_pct"]  # проверка по факту, п.п.
+        out_rows["model_err_pct"] = 100 * (out_rows["cum_model_forecast"] / out_rows["cum_fact"] - 1)
 
+        eff = 100 * cum[-1] / plan_m
         e = evals[sc][winner]
-        e = e.loc[e["known_days"] == min(k, e["known_days"].max()), "err_eom"] if k < len(a) else pd.Series(dtype=float)
-        lo, hi = (cum[-1] / (1 + e.quantile(0.9)), cum[-1] / (1 + e.quantile(0.1))) if len(e) >= 5 else (np.nan, np.nan)
+        e = e.loc[e["known_days"] == min(k, e["known_days"].max()), "err_eff_pp"] if k < len(a) else pd.Series(dtype=float)
+        lo, hi = (eff - e.quantile(0.9), eff - e.quantile(0.1)) if len(e) >= 5 else (np.nan, np.nan)
         s = {"месяц": str(T), "дней факта": f"{k} из {len(a)}",
              "план": f"{plan_m:,.0f}".replace(",", " ") + (" (прогноз)" if sc else ""),
              "прогноз факта": f"{cum[-1]:,.0f}".replace(",", " "),
-             "выполнение": f"{100 * cum[-1] / plan_m:.1f}%",
-             "80% интервал выполнения": (f"{100 * lo / plan_m:.1f}% – {100 * hi / plan_m:.1f}%" if np.isfinite(lo) else "—")}
+             "эффективность": f"{eff:.1f}%",
+             "80% интервал эффективности": (f"{lo:.1f}% – {hi:.1f}%" if np.isfinite(lo) else "—")}
 
         if "debt" in d:
             debt = rows["debt"].to_numpy()
@@ -778,10 +816,11 @@ def plot_backtest(curves: dict, path: str):
     for name, (s, color, ls) in curves.items():
         ax.plot(s.index, 100 * s.values, color=color, linewidth=2, linestyle=ls, label=name)
     ax.axhline(1, color=INK2, linewidth=1, linestyle=(0, (1, 2)))
-    ax.annotate("цель 1%", (0, 1), xytext=(2, 4), textcoords="offset points", color=INK2, fontsize=9)
+    ax.annotate("цель 1 п.п.", (0, 1), xytext=(2, 4), textcoords="offset points", color=INK2, fontsize=9)
     ax.set_xlabel("Сколько дней месяца уже известно", color=INK2)
-    ax.set_ylabel("Средняя |ошибка| итога месяца, %", color=INK2)
-    ax.set_title("Бэктест: ошибка прогноза итога месяца", color=INK, loc="left", fontsize=12)
+    ax.set_ylabel("Средняя |разница эффективности|, п.п.", color=INK2)
+    ax.set_title("Бэктест: эффективность прогноза против эффективности факта на конец месяца",
+                 color=INK, loc="left", fontsize=12)
     ax.legend(frameon=False, fontsize=9, labelcolor=INK2)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
@@ -823,14 +862,33 @@ def plot_month(g: pd.DataFrame, path: str):
 def _summary_table(best, evals):
     def w_str(w):
         return " / ".join(f"{x:g}" for x in w)
-    return pd.DataFrame({
-        name: {
+
+    def pp(x):
+        return f"{x:.2f} п.п."
+
+    rows = {}
+    for name, cfg in best.items():
+        e = evals[name]
+        by_k = e.groupby("known_days")["err_eff_pp"]
+        within = by_k.apply(lambda s: (s.abs() <= 1).mean())
+        e0 = e[e["known_days"] == 0]
+        rows[name] = {
             "веса: бустинг / ×уровень / реф.": w_str(cfg["w"]), "alpha": cfg["alpha"],
-            **{f"итог, известно {k} дн.": f"{100 * evals[name].groupby('known_days')['err_eom'].apply(lambda s: s.abs().mean()).get(k, np.nan):.2f}%"
+            **{f"конец мес., известно {k} дн.": pp(by_k.apply(lambda s: s.abs().mean()).get(k, np.nan))
                for k in REPORT_KNOWN_DAYS},
-            "на даты, с начала мес.": f"{100 * evals[name].query('known_days == 0')['err_path'].mean():.2f}%",
-            "дневной WAPE": f"{100 * evals[name].query('known_days == 0')['err_daily_wape'].mean():.1f}%",
-        } for name, cfg in best.items()})
+            "месяцев ≤ 1 п.п. (известно 0 / 10 / 20 дн.)": " / ".join(f"{100 * within.get(k, np.nan):.0f}%" for k in (0, 10, 20)),
+            "на даты, прогноз с 1-го: ср.|разница|": pp(e0["eff_dates_pp"].mean()),
+            "на даты, прогноз с 1-го: дат ≤ 1 п.п.": f"{100 * e0['eff_dates_within1'].mean():.0f}%",
+            "дневной WAPE": f"{100 * e0['err_daily_wape'].mean():.1f}%",
+        }
+    return pd.DataFrame(rows)
+
+
+def _reach(e: pd.DataFrame, share=0.8):
+    """С какого числа известных дней разница эффективности на конец месяца ≤ 1 п.п. в доле share месяцев."""
+    within = e.groupby("known_days")["err_eff_pp"].apply(lambda s: (s.abs() <= 1).mean())
+    ok = within[within >= share]
+    return int(ok.index.min()) if len(ok) else None
 
 
 def _hl(h):
@@ -873,25 +931,32 @@ def run(df: pd.DataFrame, last_fact_date=LAST_FACT_DATE, make_plots=True):
         bt_debt["pred_model"], bt_debt["pred_model_pu"] = bt["pred_model_debt"], bt["pred_model_debt_pu"]
         s1 = tune(bt_debt)[M_BOOST]["score"]
         use_debt = s1 < s0
-        print(f"Признаки долга в бустинге: средняя ошибка итога без них {100 * s0:.2f}%, с ними {100 * s1:.2f}% "
+        print(f"Признаки долга в бустинге: средняя разница эффективности без них {s0:.2f} п.п., с ними {s1:.2f} п.п. "
               f"→ {'оставляем' if use_debt else 'не используем'}.")
         if use_debt:
             bt = bt_debt
 
     best = {sfx: tune(bt, sfx) for sfx in SCENARIOS}
     evals = {sfx: {n: evaluate(bt, c["w"], c["alpha"], sfx) for n, c in best[sfx].items()} for sfx in SCENARIOS}
+    print("\nЭффективность = факт / план и прогноз / план. Ниже — разница между ними в процентных пунктах (п.п.).")
     for sfx, label in SCENARIOS.items():
-        print(f"\nСредняя |ошибка| (бэктест), {label}:")
+        print(f"\nБэктест, {label}:")
         print(_summary_table(best[sfx], evals[sfx]).to_string())
 
     winner = min(best[""], key=lambda n: best[""][n]["score"])
+    for sfx, label in SCENARIOS.items():
+        r = _reach(evals[sfx][winner])
+        print(f"Цель «≤ 1 п.п. на конец месяца в 80% месяцев», {label}: "
+              + (f"достигается, когда известно {r} дн. месяца." if r is not None else "не достигается."))
     ev = evals[""][winner]
     by_month = (ev[ev["known_days"].isin(REPORT_KNOWN_DAYS)]
-                .pivot(index="ym", columns="known_days", values="err_eom").mul(100).round(2))
+                .pivot(index="ym", columns="known_days", values="err_eff_pp").round(2))
+    by_month.insert(0, "эфф. факт, %", ev.groupby("ym")["eff_fact"].first().round(1))
     pe = bt.groupby("ym").agg(hat=("plan_m_hat", "first"), act=("plan_m", "first"))
-    by_month["ошибка прогноза плана"] = (100 * (pe["hat"] / pe["act"] - 1)).rename(index=str).round(2)
-    print(f"\nЛучший: {winner}. Ошибка итога месяца по месяцам, план загружен, % (столбцы — сколько дней известно; "
-          f"+ значит прогноз выше факта). Последний столбец — насколько ошибся бы прогноз плана:")
+    by_month["ошибка прогноза плана, %"] = (100 * (pe["hat"] / pe["act"] - 1)).rename(index=str).round(2)
+    print(f"\nЛучший: {winner}. Разница эффективности на конец месяца по месяцам, план загружен, п.п. "
+          f"(столбцы — сколько дней известно; + значит прогноз выше факта). Последний столбец — "
+          f"насколько ошибся бы прогноз плана, если бы план не был загружен:")
     print(by_month.to_string())
 
     rr_evals = {}
@@ -921,7 +986,7 @@ def run(df: pd.DataFrame, last_fact_date=LAST_FACT_DATE, make_plots=True):
     ev.to_csv(f"{OUT_DIR}/backtest_errors.csv", index=False)
     if make_plots:
         def curve(sfx, name):
-            return evals[sfx][name].groupby("known_days")["err_eom"].apply(lambda s: s.abs().mean())
+            return evals[sfx][name].groupby("known_days")["err_eff_pp"].apply(lambda s: s.abs().mean() / 100)
         curves = {f"{winner}, план загружен": (curve("", winner), BLUE, "-"),
                   f"{winner}, план ещё не загружен": (curve("_pu", winner), BLUE, (0, (4, 3)))}
         if winner != M_BOOST:
