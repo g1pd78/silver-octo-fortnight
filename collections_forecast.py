@@ -1,41 +1,36 @@
 """
-Прогноз сборов на следующий месяц (без его плана и факта) и проверка прогноза по факту на каждую дату.
+Прогноз сборов (факт против плана) на любой месяц — по каждому дню, с выполнением плана и recovery rate.
 
-ПОСТАНОВКА
-  Прогноз на месяц T делается до его начала. В момент прогноза известны факт и план по прошлым месяцам
-  и по текущему месяцу (факт — по сегодня). План и факт месяца T НЕ известны и нигде не используются.
+ЛОГИКА (как в первой версии)
+  1. Календарные признаки по производственному календарю РФ 2024–2027.
+  2. Градиентный бустинг предсказывает, какую долю МЕСЯЧНОГО плана соберут в каждый день.
+  3. Сравнение с «референсными месяцами» (ваш текущий подход) и со смесью методов.
+  4. Внутри месяца остаток корректируется по тому, как месяц идёт к текущей дате.
+  5. Бэктест: ошибка итога месяца в зависимости от того, сколько дней месяца уже известно.
 
-ИДЕЯ: факт месяца = план × уровень выполнения × календарь
-  План T      — прогноз по истории планов (последний известный план × сглаженный темп роста).
-  Календарь   — дневная модель (градиентный бустинг) по производственному календарю: какую долю плана обычно
-                собирают в каждый день при таком раскладе выходных, праздников, каникул и дней зарплат.
-                Сумма по месяцу S — «календарное» выполнение.
-  Уровень L   — платёжная дисциплина: факт / (план × S). Меняется медленно, прогнозируется сглаживанием
-                прошлых месяцев и неполного текущего.
-  Для сравнения: «тренд факта × календарь» (без плана) и ваши референсные месяцы × прогноз плана.
+ЧТО ДОБАВЛЕНО
+  6. Если план месяца ещё не загружен — он прогнозируется: итог месяца по тренду прошлых планов,
+     раскладка по дням — по последним месяцам. Бэктест считается в двух режимах:
+     «план загружен» и «план ещё не загружен» (план месяца спрогнозирован).
+  7. Recovery rate (если задан DEBT_COL): на каждый день факт / долг, накопительно Σ факт / Σ долг
+     с начала месяца и с начала данных. Долг на будущие дни прогнозируется так же, как план.
+     Признаки долга (recovery прошлых месяцев, долг к плану) проверяются бэктестом: остаются, только если помогают.
+  8. Ещё один кандидат в бэктесте — «бустинг × уровень»: бустинг без признаков уровня (только календарь и план)
+     × уровень выполнения, очищенный от календаря и сглаженный по прошлым месяцам. Нужен потому, что признак
+     «выполнение прошлого месяца» путает календарь с уровнем: предоплата в апреле перед майскими праздниками
+     поднимает прогноз мая. Берётся (сам или в смеси), только если в бэктесте точнее.
+  9. Полный набор на любой месяц (TARGET_MONTHS): прошлый, текущий или будущий — таблица по каждому дню:
+     план, факт, прогноз модели без факта месяца, итоговый прогноз с учётом факта, накопленные суммы,
+     % выполнения плана, recovery rate на дату.
 
-ПРОВЕРКА ПО ФАКТУ
-  Прогноз фиксируется в момент прогноза и сравнивается с фактом на каждую дату месяца (накопленный факт против
-  накопленного прогноза) и с итогом месяца. В бэктесте каждая модель обучена только на том, что было известно
-  в момент прогноза. Ошибка = прогноз / факт − 1 («+» — прогноз выше факта).
-
-ЧТО ПЕЧАТАЕТ
-  [1] Ошибку итога месяца в зависимости от того, за сколько дней до начала месяца сделан прогноз.
-  [2] Ошибку накопленного факта на контрольные даты для прогноза, сделанного за FORECAST_ORIGIN дней.
-  [3] По месяцам: сколько ошибки дал прогноз плана, а сколько — уровень.
-  [4] Уровень по месяцам и его скачки — примерный предел точности по трём колонкам.
-  [5] Дни с аномальным фактом (кандидаты в EXCLUDE_DATES).
-  Текущий месяц: прогноз, сделанный в прошлом месяце, против факта на сегодня. Следующий месяц: прогноз с интервалом.
-
-Вход: DataFrame с колонками дата / факт / план — суммы ЗА ДЕНЬ (если накопленные — CUMULATIVE_INPUT = True).
-Будущие даты не нужны.
+Вход: DataFrame с колонками дата / факт / план [/ долг] — значения ЗА ДЕНЬ.
+Будущие даты не нужны. Если план месяца не загружен, оставьте его пустым или не выгружайте эти даты.
 
 Зависимости: pandas, numpy, scikit-learn, matplotlib. lightgbm — по желанию, используется, если установлен.
 Запуск: заполните load_data() и выполните файл, или в Jupyter:  from collections_forecast import run;  res = run(df)
-Настройки — в блоке НАСТРОЙКИ ниже. Прогон ~1–2 минуты (с lightgbm быстрее).
+Настройки — в блоке НАСТРОЙКИ ниже. Прогон 2–4 минуты (с lightgbm быстрее; N_SEEDS = 1 — около минуты, для черновых прогонов).
 """
 
-import itertools
 import warnings
 
 import numpy as np
@@ -45,29 +40,29 @@ import pandas as pd
 # НАСТРОЙКИ
 # ============================================================================
 DATE_COL, FACT_COL, PLAN_COL = "date", "fact", "plan"
+DEBT_COL = None                # колонка «сумма долгов на дату» для recovery rate, например "debt"; None — без RR
 CUMULATIVE_INPUT = False       # True, если факт и план в выгрузке накопленные с начала месяца
 LAST_FACT_DATE = None          # последняя дата с ПОЛНЫМ фактом. None = последняя дата, где факт не пустой.
                                # Если в выгрузке есть неполный «сегодня», укажите вчерашнюю дату.
-HORIZON_MONTHS = 1             # сколько месяцев вперёд прогнозировать (1 = следующий месяц)
-FORECAST_ORIGIN = -5           # когда вы обычно делаете прогноз: за сколько дней до начала месяца
-                               # (-5 = по факту на 26-е при 31 дне; 0 = по итогам прошлого месяца)
+TARGET_MONTHS = None           # за какие месяцы выдать полный прогноз по дням, например ["2026-10", "2026-11"];
+                               # None = текущий месяц и HORIZON_MONTHS следующих
+HORIZON_MONTHS = 1             # сколько месяцев после текущего прогнозировать, если TARGET_MONTHS = None
+RR_DENOM = "sum"               # recovery rate на дату: "sum" — Σ факт / Σ долг за те же дни;
+                               # "last" — Σ факт / долг на эту дату (если долг — остаток портфеля на дату)
+BACKTEST_FROM = "2025-01"      # с какого месяца считать бэктест (более ранние месяцы — только обучение)
 PAYDAYS = (5, 10, 15, 20, 25)  # типичные дни зарплаты/аванса клиентов; выходной -> предыдущий рабочий день
 N_REF_MONTHS = 3               # сколько предыдущих месяцев брать в методе референсных месяцев
-MIN_TRAIN_MONTHS = 12          # минимум полных месяцев для обучения первой модели бэктеста
-RECENCY_HALFLIFE = 12          # вес наблюдения в дневной модели падает вдвое каждые N месяцев (None — без весов)
-EXCLUDE_DATES = []             # разовые аномалии (продажа портфеля, крупная досрочка): не учить на них модель
-                               # и не сдвигать по ним уровень, например ["2025-03-14"]
-ORIGINS_REPORT = (-20, -10, -5, 0)      # моменты прогноза в таблице [1]
-ORIGIN_RANGE = range(-25, 1)            # все моменты прогноза в бэктесте (по ним подбирается сглаживание)
-CHECK_DAYS = (1, 3, 5, 10, 15, 20, 25)  # контрольные даты для проверки накопленного факта (+ конец месяца)
-TREND_HALFLIVES = (0, 1, 3, 6, 12, np.inf)   # темп роста плана/факта: 0 = без роста, иначе полураспад весов, мес.
-LEVEL_HALFLIVES = (1, 2, 3, 6, 12, np.inf)   # сглаживание уровня: вес месяца падает вдвое каждые N месяцев
-LEVEL_PRIOR_WEIGHTS = (0, 1, 3, 10, np.inf)  # тяга уровня к среднему модели (inf = уровень не подстраивать)
-PARTIAL_GAINS = (0, 0.5, 1, 2)               # вес неполного текущего месяца при прогнозе следующего
+RECENCY_HALFLIFE = 12          # вес наблюдения падает вдвое каждые N месяцев давности (None — без весов)
+EXCLUDE_DATES = []             # аномальные даты, которые не брать в обучение, например ["2025-03-14"]
+REPORT_KNOWN_DAYS = (0, 1, 3, 5, 10, 15, 20, 25)  # «сколько дней месяца уже известно» в отчёте
+ALPHAS = np.round(np.arange(0, 1.01, 0.1), 2)          # сила коррекции остатка по ходу месяца
+LEVEL_HALFLIVES = (1, 2, 3, 6, 12, np.inf)   # «бустинг × уровень»: вес прошлого месяца падает вдвое каждые N мес.
+LEVEL_PRIOR_WEIGHTS = (0, 1, 3, 10, np.inf)  # «бустинг × уровень»: тяга уровня к среднему (inf = не подстраивать)
+PROFILE_MONTHS = 6             # по скольким последним месяцам раскладывать прогноз плана/долга по дням
+TREND_HALFLIVES = (0, 1, 3, 6, 12, np.inf)  # темп роста плана/долга: 0 = без роста, иначе полураспад весов, мес.
 OUT_DIR = "."
 RANDOM_STATE = 42
 N_SEEDS = 5                    # сколько бустингов с разными seed усреднять (1 — быстрее, но прогноз «дрожит»)
-CALENDAR_BLENDS = (0.0, 0.5, 1.0)  # доля бустинга в календарной модели (0 = только GLM); лучшая выбирается бэктестом
 
 # ============================================================================
 # ПРОИЗВОДСТВЕННЫЙ КАЛЕНДАРЬ РФ
@@ -181,59 +176,234 @@ def _cum_to_daily(s: pd.Series) -> pd.Series:
     return f.diff().fillna(f).reindex(s.index)
 
 
+def target_months(cur):
+    if TARGET_MONTHS:
+        return sorted(pd.Period(m, "M") for m in TARGET_MONTHS)
+    return [cur + i for i in range(HORIZON_MONTHS + 1)]
+
+
 def prepare(df: pd.DataFrame, last_fact_date=None):
-    """Дневная сетка до конца горизонта прогноза + календарные признаки + месячная таблица."""
-    d = df[[DATE_COL, FACT_COL, PLAN_COL]].copy()
-    d.columns = ["date", "fact", "plan"]
+    """Дневная сетка до конца последнего прогнозного месяца + календарь.
+    plan_actual / debt_actual — только известные значения (неизвестные дни пустые)."""
+    cols = {DATE_COL: "date", FACT_COL: "fact", PLAN_COL: "plan"}
+    if DEBT_COL:
+        cols[DEBT_COL] = "debt"
+    d = df[list(cols)].rename(columns=cols)
     d["date"] = pd.to_datetime(d["date"]).dt.normalize()
-    d = d.groupby("date", as_index=False).agg(fact=("fact", lambda s: s.sum(min_count=1)),
-                                              plan=("plan", lambda s: s.sum(min_count=1)))
+    value_cols = [c for c in d.columns if c != "date"]
+    d = d.groupby("date", as_index=False)[value_cols].sum(min_count=1)
+
     if last_fact_date is None:
         last_fact_date = d.loc[d["fact"].notna(), "date"].max()
     last_fact_date = pd.Timestamp(last_fact_date)
-    last_plan_date = d.loc[d["plan"].notna(), "date"].max()
+    cur = (last_fact_date + pd.Timedelta(days=1)).to_period("M")      # первый месяц без полного факта
+    targets = target_months(cur)
     start = d["date"].min()
-    end = max(d["date"].max(), (last_fact_date.to_period("M") + HORIZON_MONTHS + 1).end_time.normalize())
+    end = max(d["date"].max(), max(targets).end_time.normalize(), (cur + 1).end_time.normalize())
 
     d = pd.DataFrame({"date": pd.date_range(start, end, freq="D")}).merge(d, on="date", how="left")
     d["ym"] = d["date"].dt.to_period("M")
     if CUMULATIVE_INPUT:  # накопленные с начала месяца -> дневные
-        for col in ["fact", "plan"]:
-            d[col] = d.groupby("ym")[col].transform(_cum_to_daily)
-    known_f, known_p = d["date"] <= last_fact_date, d["date"] <= last_plan_date
-    d["fact"] = d["fact"].where(known_f).fillna(0.0).where(known_f).round(2)
-    d["plan"] = d["plan"].where(known_p).fillna(0.0).where(known_p).round(2)
+        for c in ["fact", "plan"]:
+            d[c] = d.groupby("ym")[c].transform(_cum_to_daily)
+    kf = d["date"] <= last_fact_date
+    d["fact"] = d["fact"].where(kf).fillna(0.0).where(kf).round(2)
+
+    for c in value_cols[1:]:  # plan, debt
+        last = d.loc[d[c].notna(), "date"].max()
+        kn = d["date"] <= last
+        filled = d[c].fillna(0.0) if c == "plan" else d[c].ffill()  # пропуск внутри известного: план 0, долг как вчера
+        d[f"{c}_actual"] = filled.where(kn).round(2)
+    # месяц с нулевым планом считаем незагруженным
+    zero = d.groupby("ym")["plan_actual"].transform("sum") == 0
+    d.loc[zero, "plan_actual"] = np.nan
 
     d = d.merge(build_calendar(start, end), on="date", how="left")
-
-    mt = pd.DataFrame(index=pd.period_range(d["ym"].min(), d["ym"].max(), freq="M"))
-    mt["fact_m"] = d.groupby("ym")["fact"].sum()
-    mt["plan_m"] = d.groupby("ym")["plan"].sum()
-    whole = mt.index.start_time >= start                                   # месяц целиком внутри данных
-    mt["complete"] = whole & (mt.index.end_time.normalize() <= last_fact_date)
-    mt["plan_full"] = whole & (mt.index.end_time.normalize() <= last_plan_date) & (mt["plan_m"] > 0)
-    mt.loc[~mt["plan_full"], "plan_m"] = np.nan
-    mt.loc[~mt["complete"], "fact_m"] = np.nan
-
-    d["plan_m"] = d["ym"].map(mt["plan_m"])
-    d["y"] = d["fact"] / d["plan_m"]  # цель дневной модели: доля плана месяца, собранная в этот день
-    return d, mt, last_fact_date
-
-
-# Признаки дневной модели: только календарь. Плана прогнозного месяца нет, а уровень прогнозируется отдельно,
-# чтобы «календарные» месяцы (январь, май) не тянули за собой следующий.
-SHAPE_FEATURES = (["dow", "day", "month", "dim", "days_to_eom", "is_workday", "is_holiday",
-                   "wd_num", "wd_total", "wd_left", "wd_frac", "nonwork_before", "nonwork_after",
-                   "first_wd_month", "last_wd_month", "ny_break", "days_since_pay"]
-                  + [f"pay_{p}" for p in PAYDAYS])
-
-M_FULL, M_FACT, M_REF = "План × уровень × календарь", "Тренд факта × календарь", "Референсные месяцы × прогноз плана"
-METHODS = (M_FULL, M_FACT, M_REF)
-SHORT = {M_FULL: "план×уровень", M_FACT: "тренд факта", M_REF: "реф. месяцы"}
+    return d, last_fact_date, cur, targets
 
 
 # ============================================================================
-# ДНЕВНАЯ МОДЕЛЬ («календарь»)
+# ПРОГНОЗ ПЛАНА И ДОЛГА (для дней и месяцев, где их ещё нет)
+# ============================================================================
+def full_months(frame: pd.DataFrame, col: str) -> pd.Series:
+    """Итоги месяцев, где ряд известен на все дни месяца."""
+    g = frame.groupby("ym")[f"{col}_actual"]
+    n_known, n_rows = g.count(), g.size()
+    dim = pd.Series([m.days_in_month for m in n_rows.index], index=n_rows.index)
+    ok = (n_known == n_rows) & (n_rows == dim)
+    return g.sum()[ok]
+
+
+def trend_forecast(s: pd.Series, T, h: float) -> float:
+    """Последнее значение × сглаженный темп роста (h = 0 — без роста; иначе вес темпа падает вдвое каждые h мес.)."""
+    s = s.dropna()
+    s = s[s > 0]
+    if s.empty:
+        return np.nan
+    steps = (T - s.index[-1]).n
+    g = 0.0
+    if h != 0 and len(s) >= 2:
+        gaps = np.array([(b - a).n for a, b in zip(s.index[:-1], s.index[1:])], float)
+        lg = np.diff(np.log(s.to_numpy())) / gaps
+        ages = np.arange(len(lg))[::-1]
+        w = 0.5 ** (ages / h) if np.isfinite(h) else np.ones(len(lg))
+        g = (w * lg).sum() / w.sum()
+    return float(s.iloc[-1] * np.exp(g * steps))
+
+
+def series_total_forecast(totals: pd.Series, T, cfg) -> float:
+    """Итог месяца T по полным месяцам до T: последний × темп роста (за месяц или в пересчёте на день)."""
+    hist = totals[totals.index < T]
+    if hist.empty:
+        return np.nan
+    if cfg["unit"] == "день":
+        per_day = hist / np.array([m.days_in_month for m in hist.index])
+        return trend_forecast(per_day, T, cfg["h"]) * T.days_in_month
+    return trend_forecast(hist, T, cfg["h"])
+
+
+def series_profile(frame: pd.DataFrame, col: str, T, how: str, totals: pd.Series) -> np.ndarray:
+    """Раскладка итога месяца T по дням (доли, сумма = 1) по последним PROFILE_MONTHS полным месяцам до T:
+    по числу месяца или по номеру рабочего дня (все нерабочие дни — одна общая доля)."""
+    rows = frame[frame["ym"] == T]
+    hist = [m for m in totals.index if m < T][-PROFILE_MONTHS:]
+    if not hist:
+        return np.full(len(rows), 1.0 / len(rows))
+    h = frame[frame["ym"].isin(hist)]
+    share = (h[f"{col}_actual"] / h["ym"].map(totals).replace(0, np.nan)).to_numpy()
+    if how == "по рабочим дням":
+        key_h = np.where(h["is_workday"] == 1, h["wd_num"], 0)
+        key_t = np.where(rows["is_workday"] == 1, rows["wd_num"], 0)
+    else:
+        key_h, key_t = h["day"].to_numpy(), rows["day"].to_numpy()
+    mean_by_key = pd.Series(share).groupby(key_h).mean()
+    prof = pd.Series(key_t).map(mean_by_key).to_numpy(dtype=float)
+    fallback = np.nanmean(share) if np.isfinite(share).any() else 1.0
+    prof = np.where(np.isnan(prof), fallback, prof)
+    s = prof.sum()
+    return prof / s if s > 0 else np.full(len(rows), 1.0 / len(rows))
+
+
+def fill_series(frame: pd.DataFrame, col: str, cfg: dict, months=None) -> pd.Series:
+    """Заполняет неизвестные дни ряда col (plan / debt). Известная часть месяца остаётся как есть;
+    остальное = итог месяца × раскладка по дням. Итог месяца — по известной части (если она ≥ 25% месяца
+    по раскладке), иначе по тренду прошлых месяцев."""
+    s = frame[f"{col}_actual"].copy()
+    totals = full_months(frame, col)
+    todo = sorted(m for m in frame.loc[s.isna(), "ym"].unique() if months is None or m in months)
+    for T in todo:
+        idx = frame.index[frame["ym"] == T]
+        known = s.loc[idx].notna().to_numpy()
+        prof = series_profile(frame, col, T, cfg["profile"], totals)
+        k_share = prof[known].sum()
+        if known.any() and k_share >= 0.25:
+            total = s.loc[idx][known].sum() / k_share
+        else:
+            total = series_total_forecast(totals, T, cfg)
+        s.loc[idx[~known]] = total * prof[~known]
+    return s
+
+
+def tune_series(frame: pd.DataFrame, col: str) -> dict:
+    """Подбор прогноза итога месяца (за месяц / в день, темп роста) и раскладки по дням — по прошлым месяцам."""
+    totals = full_months(frame, col)
+    test = [m for m in totals.index if m >= pd.Period(BACKTEST_FROM, "M") and (totals.index < m).any()]
+    if not test:
+        test = list(totals.index[1:])
+    best = None
+    for unit in ("месяц", "день"):
+        for h in TREND_HALFLIVES:
+            cfg = dict(unit=unit, h=h)
+            err = np.array([series_total_forecast(totals, m, cfg) / totals[m] - 1 for m in test])
+            score = np.nanmean(np.abs(err))
+            if best is None or score < best["total_err"] - 1e-12:
+                best = dict(cfg, total_err=score)
+    prof_err = {}
+    for how in ("по дням месяца", "по рабочим дням"):
+        errs = []
+        for m in test:
+            a = frame.loc[frame["ym"] == m, f"{col}_actual"].to_numpy()
+            p = series_profile(frame, col, m, how, totals)
+            errs.append(np.abs(p * a.sum() - a).sum() / a.sum())
+        prof_err[how] = np.mean(errs)
+    best["profile"] = min(prof_err, key=prof_err.get)
+    best["profile_err"] = prof_err[best["profile"]]
+    return best
+
+
+# ============================================================================
+# ПРИЗНАКИ
+# ============================================================================
+def add_plan_features(f: pd.DataFrame) -> pd.DataFrame:
+    """Признаки плана (доли месячного плана). План — известный или спрогнозированный."""
+    f["plan_m"] = f.groupby("ym")["plan"].transform("sum")
+    pm = f["plan_m"].replace(0, np.nan)
+    f["plan_share"] = f["plan"] / pm
+    f["plan_cum_share"] = f.groupby("ym")["plan"].cumsum() / pm
+    f["plan_next3"] = sum(f["plan"].shift(-k) for k in (1, 2, 3)) / pm
+    f["plan_prev3"] = sum(f["plan"].shift(k) for k in (1, 2, 3)) / pm
+    # план, пришедшийся на нерабочие дни прямо перед этим днём (его часто платят в первый рабочий)
+    acc, prev_nw = 0.0, np.zeros(len(f))
+    for i, (p, wk) in enumerate(zip(np.nan_to_num(f["plan"].to_numpy()), f["is_workday"].to_numpy())):
+        prev_nw[i] = acc
+        acc = 0.0 if wk else acc + p
+    f["plan_prev_nw"] = prev_nw / pm
+    return f
+
+
+def month_table(d: pd.DataFrame, last_fact_date) -> pd.DataFrame:
+    g = d.groupby("ym")
+    mt = pd.DataFrame(index=pd.period_range(d["ym"].min(), d["ym"].max(), freq="M"))
+    mt["plan_m"] = g["plan"].sum()
+    mt["plan_known"] = g["plan_actual"].count() == g.size()
+    mt["fact_m"] = g["fact"].sum()
+    whole = mt.index.start_time >= d["date"].min()
+    mt["complete"] = whole & (mt.index.end_time.normalize() <= last_fact_date)
+    ok = mt["complete"] & mt["plan_known"]
+    mt["rate"] = np.where(ok, mt["fact_m"] / mt["plan_m"].replace(0, np.nan), np.nan)
+    if "debt" in d:
+        mt["debt_m"] = g["debt"].sum()
+        mt["debt_last"] = g["debt"].last()
+        mt["rr"] = np.where(mt["complete"], mt["fact_m"] / mt["debt_m"].replace(0, np.nan), np.nan)
+    return mt
+
+
+BASE_LEVEL = ["rate_prev1", "rate_prev3", "rate_ly", "plan_growth"]
+DEBT_LEVEL = ["rr_prev1", "rr_prev3", "debt_cover"]
+CAL_FEATURES = (["dow", "day", "month", "dim", "days_to_eom", "is_workday", "is_holiday",
+                 "wd_num", "wd_total", "wd_left", "wd_frac", "nonwork_before", "nonwork_after",
+                 "first_wd_month", "last_wd_month", "ny_break", "days_since_pay"]
+                + [f"pay_{p}" for p in PAYDAYS])
+PLAN_FEATURES = ["plan_share", "plan_cum_share", "plan_next3", "plan_prev3", "plan_prev_nw"]
+
+
+def feature_list(use_debt: bool) -> list:
+    return CAL_FEATURES + PLAN_FEATURES + BASE_LEVEL + (DEBT_LEVEL if use_debt else [])
+
+
+def month_level_features(mt: pd.DataFrame, rate: pd.Series, rr: pd.Series = None, use_debt=False) -> pd.DataFrame:
+    """Признаки уровня месяца, известные на его начало (по предыдущим месяцам)."""
+    f = pd.DataFrame(index=mt.index)
+    f["rate_prev1"] = rate.shift(1)
+    f["rate_prev3"] = rate.shift(1).rolling(3, min_periods=1).mean()
+    f["rate_ly"] = rate.shift(12)
+    f["plan_growth"] = mt["plan_m"] / mt["plan_m"].shift(1).rolling(3, min_periods=1).mean() - 1
+    if use_debt:
+        rr = mt["rr"] if rr is None else rr
+        dim = np.array([m.days_in_month for m in mt.index])
+        f["rr_prev1"] = rr.shift(1)                                           # recovery прошлого месяца
+        f["rr_prev3"] = rr.shift(1).rolling(3, min_periods=1).mean()
+        f["debt_cover"] = (mt["debt_m"] / dim).shift(1) * dim / mt["plan_m"]  # долг прошлого месяца к плану этого
+    return f
+
+
+def attach_level(frame: pd.DataFrame, lvl: pd.DataFrame) -> pd.DataFrame:
+    frame = frame.drop(columns=[c for c in BASE_LEVEL + DEBT_LEVEL if c in frame.columns])
+    return frame.merge(lvl, left_on="ym", right_index=True, how="left")
+
+
+# ============================================================================
+# МОДЕЛИ
 # ============================================================================
 def make_model(seed=RANDOM_STATE):
     try:
@@ -266,148 +436,31 @@ class SeedBag:
         return np.mean([m.predict(X) for m in self.models], axis=0)
 
 
-def glm_features(g: pd.DataFrame) -> pd.DataFrame:
-    """Признаки для мультипликативной модели: профиль по числу месяца × день недели × эффекты выходных и праздников."""
-    work = g["is_workday"] == 1
-    X = {f"d{dd}": g["day"] == dd for dd in range(1, 32)}
-    X.update({f"w{w}": g["dow"] == w for w in range(7)})
-    X.update(work=work, hol=g["is_holiday"] == 1)
-    for k in (1, 2, 3):
-        X[f"nb{k}"] = work & (g["nonwork_before"].clip(upper=3) == k)  # первый рабочий день после k выходных
-        X[f"na{k}"] = work & (g["nonwork_after"].clip(upper=3) == k)   # последний рабочий день перед k выходными
-    X = pd.DataFrame(X, index=g.index).astype(float)
-    X["nb_long"] = (work & (g["nonwork_before"] >= 3)) * np.log1p(g["nonwork_before"])  # после длинных каникул
-    X["na_long"] = (work & (g["nonwork_after"] >= 3)) * np.log1p(g["nonwork_after"])    # перед длинными каникулами
-    X["first_wd"], X["last_wd"], X["ny"] = g["first_wd_month"], g["last_wd_month"], g["ny_break"]
-    for p in PAYDAYS:
-        X[f"pay{p}"] = g[f"pay_{p}"]
-    X["dim"] = g["dim"] - 30.5
-    return X
-
-
-class CalendarGLM:
-    """Пуассоновская регрессия (лог-ссылка): жёстче бустинга, лучше держит сумму за месяц на короткой истории."""
-    SCALE = 30.0
-
-    def fit(self, train, sample_weight=None):
-        from sklearn.linear_model import PoissonRegressor
-        self.m = PoissonRegressor(alpha=1e-4, max_iter=3000).fit(
-            glm_features(train), train["y"].clip(lower=0) * self.SCALE, sample_weight=sample_weight)
-        return self
-
-    def predict(self, g):
-        return self.m.predict(glm_features(g)) / self.SCALE
-
-
-def fit_models(train: pd.DataFrame, target_month):
+def fit_model(train: pd.DataFrame, target_month, feats: list):
     tr = train[~train["date"].isin(pd.to_datetime(EXCLUDE_DATES))]
     w = None
     if RECENCY_HALFLIFE:
         age = (target_month - tr["ym"]).apply(lambda x: x.n).to_numpy()
         w = 0.5 ** (age / RECENCY_HALFLIFE)
-    boost = SeedBag().fit(tr[SHAPE_FEATURES], tr["y"], sample_weight=w)
-    glm = CalendarGLM().fit(tr, sample_weight=w)
-    return boost, glm
+    feats = [f for f in feats if tr[f].notna().any()]  # признак без единого значения (напр. rate_ly в первый год) — пропускаем
+    model = SeedBag().fit(tr[feats], tr["y"], sample_weight=w)
+    model.feats_ = feats
+    return model
 
 
-def walk_forward(d: pd.DataFrame, train_months: list, origin):
-    """Для каждого месяца k: модели обучены только на полных месяцах ДО k и прогнозируют месяцы k и k+1
-    (последние, рабочие модели — до конца горизонта). Прогноз — доля плана месяца на каждый день.
-    Возвращает прогнозы бустинга и GLM отдельно: их смесь выбирается по бэктесту."""
-    by_month = {m: g.reset_index(drop=True) for m, g in d.groupby("ym")}
-    first = train_months[0] + MIN_TRAIN_MONTHS
-    if first > origin:
-        raise ValueError(f"Мало истории: нужно хотя бы {MIN_TRAIN_MONTHS} полных месяцев (уменьшите MIN_TRAIN_MONTHS)")
-    pb, pg = {}, {}
-    for k in pd.period_range(first, origin, freq="M"):
-        train = d[(d["ym"] < k) & d["ym"].isin(train_months)]
-        boost, glm = fit_models(train, k)
-        last = k + 1 if k < origin else origin + HORIZON_MONTHS
-        for t in pd.period_range(k, last, freq="M"):
-            if t in by_month and len(by_month[t]) == t.days_in_month:
-                g = by_month[t]
-                pb[(k, t)] = np.clip(boost.predict(g[SHAPE_FEATURES]), 0, None)
-                pg[(k, t)] = np.clip(glm.predict(g), 0, None)
-        print(f"  модели {k}: обучены на {train['ym'].nunique()} мес.")
-    return pb, pg, by_month
+def predict_share(model, rows: pd.DataFrame) -> np.ndarray:
+    """Прогноз доли месячного плана на каждый день."""
+    return np.clip(model.predict(rows[model.feats_]), 0, None)
 
 
-# ============================================================================
-# ПЛАН, УРОВЕНЬ, ТРЕНД
-# ============================================================================
-def adjusted_fact(g: pd.DataFrame, expected: np.ndarray) -> np.ndarray:
-    """Факт, в котором дни из EXCLUDE_DATES заменены ожиданием модели (чтобы разовые суммы не сдвигали уровень)."""
-    excl = g["date"].isin(pd.to_datetime(EXCLUDE_DATES)).to_numpy()
-    return np.where(excl, expected, g["fact"].to_numpy())
-
-
-def level_history(preds, by_month, mt, train_months) -> pd.DataFrame:
-    rows = []
-    for m in train_months:
-        if (m, m) not in preds:
-            continue
-        g = by_month[m]
-        plan_m = mt.loc[m, "plan_m"]
-        share = preds[(m, m)]
-        fa = adjusted_fact(g, share * plan_m).sum()
-        rows.append(dict(ym=m, P=plan_m, F=g["fact"].sum(), R=g["fact"].sum() / plan_m, S=share.sum(),
-                         L=fa / (plan_m * share.sum()), A=fa / share.sum()))
-    lv = pd.DataFrame(rows).set_index("ym")
-    lv["dL"] = lv["L"].pct_change()
-    lv["dP"] = lv["P"].pct_change()
-    return lv
-
-
-def trend_forecast(s: pd.Series, T, h: float) -> float:
-    """Последнее значение × сглаженный темп роста (h = 0 — без роста; иначе вес темпа падает вдвое каждые h мес.)."""
-    s = s.dropna()
-    s = s[s > 0]
-    if s.empty:
-        return np.nan
-    steps = (T - s.index[-1]).n
-    g = 0.0
-    if h != 0 and len(s) >= 2:
-        gaps = np.array([(b - a).n for a, b in zip(s.index[:-1], s.index[1:])], float)
-        lg = np.diff(np.log(s.to_numpy())) / gaps
-        ages = np.arange(len(lg))[::-1]
-        w = 0.5 ** (ages / h) if np.isfinite(h) else np.ones(len(lg))
-        g = (w * lg).sum() / w.sum()
-    return float(s.iloc[-1] * np.exp(g * steps))
-
-
-def plan_forecast(case, cfg) -> float:
-    s = case["plans"]
-    if cfg["unit"] == "день":
-        return trend_forecast(s / s.index.days_in_month, case["T"], cfg["h"]) * case["T"].days_in_month
-    return trend_forecast(s, case["T"], cfg["h"])
-
-
-def level_estimate(case, h, w0, gain) -> float:
-    """Уровень на прогнозный месяц: взвешенное среднее уровней прошлых месяцев (вес падает с давностью),
-    неполного текущего месяца (вес ~ его собранной доле × gain) и «нейтрального» уровня 1 с весом w0."""
-    if np.isinf(w0):
-        return 1.0
-    decay = (lambda a: 0.5 ** (np.asarray(a, float) / h)) if np.isfinite(h) else (lambda a: np.ones_like(np.asarray(a, float)))
-    w = decay(case["ages"])
-    num, den = w0 + (w * case["Ls"]).sum(), w0 + w.sum()
-    if case["partial"] is not None and gain > 0:
-        lp, age, frac = case["partial"]
-        wp = gain * frac * float(decay(age))
-        num, den = num + wp * lp, den + wp
-    return num / den if den > 0 else 1.0
-
-
-# ============================================================================
-# ПРОГНОЗ НА МЕСЯЦ ИЗ ЗАДАННОГО МОМЕНТА
-# ============================================================================
-def reference_curve(by_month, T, refs) -> np.ndarray:
-    """Текущий подход: средняя кривая выполнения (накопл. факт / план месяца) референсных месяцев
-    по календарному дню. Возвращает дневные доли плана."""
-    n = T.days_in_month
+def reference_curve(d: pd.DataFrame, month, refs) -> np.ndarray:
+    """Текущий подход: средняя кривая выполнения (накопл. факт / план месяца) по референсным месяцам,
+    по календарному дню. Возвращает дневные доли плана (умножить на план месяца)."""
+    n = month.days_in_month
     curves = []
     for r in refs:
-        g = by_month.get(r)
-        if g is None or g["fact"].isna().any() or not g["plan_m"].iloc[0] > 0:
+        g = d[d["ym"] == r]
+        if g.empty or g["fact"].isna().any() or not g["plan_m"].iloc[0] > 0:
             continue
         c = (g["fact"].cumsum() / g["plan_m"]).to_numpy()
         curves.append(np.concatenate([c, np.repeat(c[-1], max(0, n - len(c)))])[:n])
@@ -416,273 +469,294 @@ def reference_curve(by_month, T, refs) -> np.ndarray:
     return np.diff(np.r_[0.0, np.mean(curves, axis=0)])
 
 
-def build_case(T, Op, c, ctx):
-    """Всё, что известно о месяце T в момент прогноза: идёт месяц Op, по нему известно c дней факта
-    (c = 0 — прогноз по итогам месяца перед Op). План и факт месяца T не используются."""
-    preds, by_month, lv, mt = ctx["preds"], ctx["by_month"], ctx["lv"], ctx["mt"]
-    g = by_month[T]
-    k = c - sum(p.days_in_month for p in pd.period_range(Op, T - 1, freq="M")) if T > Op else 0
-    hist = lv[lv.index < Op]
-    known_plans = mt.loc[mt["plan_full"] & (mt.index <= min(Op, T - 1)), "plan_m"]
-    case = dict(T=T, Op=Op, c=c, k=k, share=preds[(Op, T)], Ls=hist["L"].to_numpy(),
-                ages=np.array([(T - m).n for m in hist.index], float), A=hist["A"], plans=known_plans,
-                partial=None, dates=g["date"].to_numpy(), actual=g["fact"].to_numpy(),
-                plan_actual=mt.loc[T, "plan_m"])
-    if c > 0 and mt.loc[Op, "plan_full"] and (Op, Op) in preds:
-        go = by_month[Op]
-        sh = preds[(Op, Op)]
-        e = sh * mt.loc[Op, "plan_m"]
-        a = adjusted_fact(go, e)
-        case["partial"] = (a[:c].sum() / e[:c].sum(), (T - Op).n, sh[:c].sum() / sh.sum())
-    refs = [m for m in ctx["train_months"] if m < Op][-N_REF_MONTHS:]
-    case["ref"] = reference_curve(by_month, T, refs)
-    return case
-
-
-def forecast_for(method, case, cfg):
-    p_hat = plan_forecast(case, cfg["plan"])
-    if method == M_REF:
-        return p_hat * case["ref"]
-    if method == M_FACT:
-        return trend_forecast(case["A"], case["T"], cfg["fact_h"]) * case["share"]
-    lv = cfg["level"]
-    return p_hat * level_estimate(case, lv["h"], lv["w0"], lv["gain"]) * case["share"]
+def plan_unknown_rows(d: pd.DataFrame, mt: pd.DataFrame, m, plan_cfg: dict, use_debt: bool) -> pd.DataFrame:
+    """Строки месяца m такими, какими они видны, если план m (и следующих месяцев) ещё не загружен:
+    план спрогнозирован только по месяцам до m."""
+    f = d[["date", "ym", "day", "is_workday", "wd_num", "plan_actual"]].copy()
+    f.loc[f["ym"] >= m, "plan_actual"] = np.nan
+    f["plan"] = fill_series(f, "plan", plan_cfg, months={m, m + 1})
+    f = add_plan_features(f)
+    rows = d[d["ym"] == m].copy()
+    fm = f[f["ym"] == m]
+    for c in ["plan", "plan_m"] + PLAN_FEATURES:
+        rows[c] = fm[c].to_numpy()
+    mt2 = mt.copy()
+    mt2.loc[m, "plan_m"] = rows["plan_m"].iloc[0]
+    return attach_level(rows, month_level_features(mt2, mt2["rate"], use_debt=use_debt))
 
 
 # ============================================================================
-# БЭКТЕСТ: прогноз фиксируется в момент прогноза и сверяется с фактом месяца
+# NOWCAST: КОРРЕКЦИЯ ОСТАТКА ПО ХОДУ МЕСЯЦА
 # ============================================================================
-def backtest_cases(ctx):
-    cases = []
-    for T in ctx["train_months"]:
-        if not all(key in ctx["preds"] for key in [(T - 1, T), (T, T), (T - 1, T - 1)]):
-            continue
-        if not (ctx["lv"].index < T - 1).any():  # нужен хотя бы один прошлый месяц с уровнем — одинаково для всех моментов
-            continue
-        for k in ORIGIN_RANGE:
-            Op, c = (T, 0) if k == 0 else (T - 1, (T - 1).days_in_month + k)
-            if c >= 1 or k == 0:
-                case = build_case(T, Op, c, ctx)
-                if not case["plans"].empty:
-                    cases.append(case)
-    if not cases:
-        raise ValueError("Нет месяцев для бэктеста: мало истории")
-    return cases
+def nowcast_path(actual: np.ndarray, pred: np.ndarray, known: int, alpha: float) -> np.ndarray:
+    """Накопленный прогноз на дни known..конец, если известны первые `known` дней факта.
+    Остаток домножается на 1 + alpha*(факт/прогноз за известные дни - 1)."""
+    ka = actual[:known].sum()
+    kp = pred[:known].sum()
+    ratio = ka / kp if known and kp > 0 else 1.0
+    return ka + np.cumsum(pred[known:] * (1 + alpha * (ratio - 1)))
 
 
-def tune(cases):
-    """Подбор параметров по бэктесту: план — по ошибке плана, тренд факта и уровень — по ошибке итога."""
-    act = np.array([c["actual"].sum() for c in cases])
-    plan_act = np.array([c["plan_actual"] for c in cases])
-    S = np.array([c["share"].sum() for c in cases])
-
-    best_p = None
-    for unit, h in itertools.product(("месяц", "день"), TREND_HALFLIVES):
-        p = np.array([plan_forecast(c, dict(unit=unit, h=h)) for c in cases])
-        score = np.nanmean(np.abs(p / plan_act - 1))
-        if best_p is None or score < best_p["score"] - 1e-12:
-            best_p = dict(unit=unit, h=h, score=score)
-    p_hat = np.array([plan_forecast(c, best_p) for c in cases])
-
-    best_f = None
-    for h in TREND_HALFLIVES:
-        a = np.array([trend_forecast(c["A"], c["T"], h) for c in cases])
-        score = np.nanmean(np.abs(a * S / act - 1))
-        if best_f is None or score < best_f[1] - 1e-12:
-            best_f = (h, score)
-
-    best_l = None
-    for h, w0, gain in itertools.product(LEVEL_HALFLIVES, LEVEL_PRIOR_WEIGHTS, PARTIAL_GAINS):
-        lvl = np.array([level_estimate(c, h, w0, gain) for c in cases])
-        score = np.nanmean(np.abs(p_hat * lvl * S / act - 1))
-        if best_l is None or score < best_l["score"] - 1e-12:
-            best_l = dict(h=h, w0=w0, gain=gain, score=score)
-    return dict(plan=best_p, fact_h=best_f[0], level=best_l)
+def eom_forecasts(actual: np.ndarray, pred: np.ndarray, alphas) -> np.ndarray:
+    """Прогноз итога месяца [alpha, known_days] (векторно)."""
+    ca = np.r_[0.0, np.cumsum(actual)][:-1]   # факт за первые k дней, k = 0..n-1
+    cp = np.r_[0.0, np.cumsum(pred)][:-1]
+    rem = pred.sum() - cp
+    ratio = np.where(cp > 0, ca / np.where(cp > 0, cp, 1), 1.0)
+    ratio[0] = 1.0
+    a = np.asarray(alphas)[:, None]
+    return ca + rem * (1 + a * (ratio - 1))
 
 
-def evaluate(cases, cfg):
-    report_k = set(ORIGINS_REPORT) | {FORECAST_ORIGIN}
-    tot, days = [], []
-    for c in cases:
-        a = c["actual"]
-        ca = np.cumsum(a)
-        p_hat = plan_forecast(c, cfg["plan"])
-        for name in METHODS:
-            f = forecast_for(name, c, cfg)
-            cf = np.cumsum(f)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                ce = np.where(ca > 0, cf / ca - 1, np.nan)
-            row = dict(method=name, ym=str(c["T"]), k=c["k"], err_total=cf[-1] / ca[-1] - 1,
-                       err_plan=p_hat / c["plan_actual"] - 1,
-                       mean_abs_cum=np.nanmean(np.abs(ce)), wape_daily=np.abs(f - a).sum() / a.sum())
-            if name == M_FULL:  # итог = план × уровень × календарь, поэтому ошибка раскладывается на множители
-                row["err_level"] = (1 + row["err_total"]) / (1 + row["err_plan"]) - 1
-            tot.append(row)
-            if c["k"] in report_k:
-                days.append(pd.DataFrame(dict(method=name, ym=str(c["T"]), k=c["k"], date=c["dates"],
-                                              day=np.arange(1, len(a) + 1), fact=a, forecast=f,
-                                              cum_fact=ca, cum_forecast=cf, cum_err=ce)))
-    return pd.DataFrame(tot), pd.concat(days, ignore_index=True)
+def eom_errors(actual: np.ndarray, pred: np.ndarray, alphas) -> np.ndarray:
+    """Ошибка итога месяца [alpha, known_days] (векторно)."""
+    return eom_forecasts(actual, pred, alphas) / actual.sum() - 1
 
 
 # ============================================================================
-# ОТЧЁТ
+# УРОВЕНЬ ДЛЯ «БУСТИНГ × УРОВЕНЬ»
 # ============================================================================
-def _k_label(k):
-    return "по итогам прошлого месяца" if k == 0 else f"за {-k} дн. до начала месяца"
+def level_estimate(L: pd.Series, T, h: float, w0: float) -> float:
+    """Уровень выполнения на месяц T = взвешенное среднее уровней прошлых месяцев (вес падает вдвое каждые h мес.)
+    и «нейтрального» уровня 1 с весом w0. Уровень месяца = факт / (план × ожидание модели без признаков уровня),
+    то есть выполнение, очищенное от календаря: апрельская предоплата перед майскими его не сдвигает."""
+    if np.isinf(w0):
+        return 1.0
+    hist = L[L.index < T].dropna()
+    ages = np.array([(T - m).n for m in hist.index], float)
+    w = 0.5 ** (ages / h) if np.isfinite(h) else np.ones(len(ages))
+    den = w0 + w.sum()
+    return float((w0 + (w * hist.to_numpy()).sum()) / den) if den > 0 else 1.0
 
 
-def _k_col(k):
-    return f"за {-k} дн."
+def month_levels(bt: pd.DataFrame) -> pd.Series:
+    g = bt.groupby("ym").agg(F=("fact", "sum"), S=("share_cal", "sum"), P=("plan_m", "first"))
+    return g["F"] / (g["S"] * g["P"])
 
 
-def _pct(x, nd=2):
-    return "—" if pd.isna(x) else f"{100 * x:+.{nd}f}%".replace("+-", "-")
+def tune_level(bt: pd.DataFrame):
+    """Подбор сглаживания уровня по ошибке итога месяца без факта месяца (известно 0 дней)."""
+    L = month_levels(bt)
+    g = bt.groupby("ym").agg(F=("fact", "sum"), S=("share_cal", "sum"), P=("plan_m", "first"))
+    best = None
+    for h in LEVEL_HALFLIVES:
+        for w0 in LEVEL_PRIOR_WEIGHTS:
+            lh = np.array([level_estimate(L, m, h, w0) for m in g.index])
+            score = np.mean(np.abs(lh * g["S"] * g["P"] / g["F"] - 1))
+            if best is None or score < best["score"] - 1e-12:
+                best = dict(h=h, w0=w0, score=score)
+    return best, L
 
 
-def _apct(x, nd=2):
-    return "—" if pd.isna(x) else f"{100 * x:.{nd}f}%"
+# ============================================================================
+# БЭКТЕСТ
+# ============================================================================
+SCENARIOS = {"": "план загружен", "_pu": "план ещё не загружен"}
+M_REF, M_BOOST, M_CAL, M_MIX = "Референсные месяцы", "Бустинг", "Бустинг × уровень", "Смесь"
+MIX_GRID = [(a, b, round(1 - a - b, 2)) for a in np.arange(0, 1.01, 0.25) for b in np.arange(0, 1.01 - a, 0.25)]
 
 
-def report_backtest(tot, days, best_name):
-    t = tot[tot["k"].isin(ORIGINS_REPORT)]
-    a = t.groupby(["method", "k"])["err_total"].agg(
-        mae=lambda s: s.abs().mean(), within=lambda s: (s.abs() < 0.01).mean()).reset_index()
-    a["v"] = a.apply(lambda r: f"{100 * r.mae:.2f}% / {100 * r.within:.0f}%", axis=1)
-    tab = a.pivot(index="method", columns="k", values="v").reindex(index=list(METHODS), columns=list(ORIGINS_REPORT))
-    tab.columns = [_k_col(k) for k in tab.columns]
-    print(f"\n[1] Ошибка ИТОГА месяца в зависимости от того, за сколько дней до начала месяца сделан прогноз "
-          f"({t['ym'].nunique()} мес. бэктеста).")
-    print("    Средняя |ошибка| / доля месяцев с |ошибкой| < 1%:")
-    print(tab.to_string())
+def backtest(d: pd.DataFrame, mt: pd.DataFrame, plan_cfg: dict, debt_cfg: dict = None):
+    """Для каждого месяца с BACKTEST_FROM: модели обучены только на месяцах до него.
+    Бустинг (как в первой версии, с признаками уровня), он же с признаками долга (если есть долг)
+    и бустинг без признаков уровня (для «бустинг × уровень»). Каждый — с загруженным и со спрогнозированным планом."""
+    has_debt = "debt" in d
+    feats = {"": feature_list(False), "_debt": feature_list(True)} if has_debt else {"": feature_list(False)}
+    dd = attach_level(d, month_level_features(mt, mt["rate"], use_debt=has_debt))
+    ok = mt.index[mt["complete"] & mt["plan_known"]]
+    test_months = [m for m in ok if m >= pd.Period(BACKTEST_FROM, "M")]
+    if not test_months:
+        raise ValueError("Нет полных месяцев для бэктеста — сдвиньте BACKTEST_FROM")
+    if has_debt:
+        debt_totals = full_months(d, "debt")
 
-    d0 = days[days["k"] == FORECAST_ORIGIN]
-    rows = {}
-    for name in METHODS:
-        g = d0[d0["method"] == name]
-        r = {f"{dd}-е": g.loc[g["day"] == dd, "cum_err"].abs().mean() for dd in CHECK_DAYS}
-        r["конец"] = g.groupby("ym")["cum_err"].last().abs().mean()
-        r["все дни"] = g["cum_err"].abs().mean()
-        rows[name] = r
-    tb = pd.DataFrame(rows).T.apply(lambda col: col.map(_apct))
-    tb["дней с |ош.|<1%"] = [f"{100 * (d0.loc[d0['method'] == n, 'cum_err'].abs() < 0.01).mean():.0f}%" for n in METHODS]
-    print(f"\n[2] Прогноз {_k_label(FORECAST_ORIGIN)}. Средняя |ошибка| НАКОПЛЕННОГО факта на дату месяца:")
-    print(tb.to_string())
-
-    t0 = tot[tot["k"] == FORECAST_ORIGIN]
-    full = t0[t0["method"] == M_FULL].set_index("ym")
-    per = pd.DataFrame({"ош. плана": full["err_plan"].map(_pct), "ош. уровня": full["err_level"].map(_pct)})
-    for name in METHODS:
-        per[f"итог: {SHORT[name]}"] = t0[t0["method"] == name].set_index("ym")["err_total"].map(_pct)
-    per["ср.|ош.| на даты"] = t0[t0["method"] == best_name].set_index("ym")["mean_abs_cum"].map(_apct)
-    print(f"\n[3] По месяцам, прогноз {_k_label(FORECAST_ORIGIN)} (+ = прогноз выше факта).")
-    print("    Для «план × уровень × календарь»: (1 + ош. итога) = (1 + ош. плана) × (1 + ош. уровня).")
-    print(per.to_string())
-    print(f"    Средняя |ошибка| прогноза плана: {_apct(full['err_plan'].abs().mean())}, "
-          f"уровня: {_apct(full['err_level'].abs().mean())}.")
-
-
-def report_level(lv):
-    t = pd.DataFrame({
-        "рост плана": lv["dP"].map(_pct),
-        "выполнение": lv["R"].map(lambda x: _apct(x, 1)),
-        "ожидание по календарю": lv["S"].map(lambda x: _apct(x, 1)),
-        "уровень L": lv["L"].map(lambda x: f"{x:.3f}"),
-        "скачок L": lv["dL"].map(_pct),
-        "скачок выполнения": lv["R"].pct_change().map(_pct),
-    })
-    t.index = t.index.astype(str)
-    print("\n[4] По месяцам. «Ожидание по календарю» — выполнение, которого модель ждала до начала месяца")
-    print("    при среднем уровне; уровень L = выполнение / ожидание. Скачки L календарём не объясняются.")
-    print(t.to_string())
-    print(f"\n    Средний |скачок| выполнения месяц к месяцу: {_apct(lv['R'].pct_change().abs().mean())}; "
-          f"после поправки на календарь (|скачок L|): {_apct(lv['dL'].abs().mean())}.")
-    print("    |Скачок L| — примерный предел точности прогноза следующего месяца по дате, факту и плану.")
+    parts = []
+    for m in test_months:
+        train = dd[(dd["ym"] < m) & dd["ym"].isin(ok) & dd["y"].notna()]
+        te = dd[dd["ym"] == m].copy()
+        pu = plan_unknown_rows(d, mt, m, plan_cfg, has_debt)    # тот же месяц, если его план ещё не загружен
+        plan_m, plan_hat = te["plan_m"].iloc[0], pu["plan_m"].iloc[0]
+        te["plan_m_hat"] = plan_hat
+        for tag, fl in feats.items():
+            model = fit_model(train, m, fl)
+            te[f"pred_model{tag}"] = predict_share(model, te) * plan_m
+            te[f"pred_model{tag}_pu"] = predict_share(model, pu) * plan_hat
+        cal = fit_model(train, m, CAL_FEATURES + PLAN_FEATURES)
+        te["share_cal"], te["share_cal_pu"] = predict_share(cal, te), predict_share(cal, pu)
+        ref = reference_curve(dd, m, [m - i for i in range(1, N_REF_MONTHS + 1)])
+        te["pred_ref"], te["pred_ref_pu"] = ref * plan_m, ref * plan_hat
+        if has_debt:  # для recovery rate: раскладка и тренд долга по месяцам до m
+            te["debt_prof"] = series_profile(d, "debt", m, debt_cfg["profile"], debt_totals)
+            te["debt_trend"] = series_total_forecast(debt_totals, m, debt_cfg)
+        parts.append(te)
+        print(f"  бэктест {m}: обучено на {train['ym'].nunique()} мес.")
+    return pd.concat(parts, ignore_index=True)
 
 
-def report_anomalies(preds, by_month, lv, top=8):
+def add_level_method(bt: pd.DataFrame, lvl_cfg: dict, L: pd.Series) -> pd.DataFrame:
+    lh = {m: level_estimate(L, m, lvl_cfg["h"], lvl_cfg["w0"]) for m in bt["ym"].unique()}
+    bt["level_hat"] = bt["ym"].map(lh)
+    bt["pred_cal"] = bt["share_cal"] * bt["plan_m"] * bt["level_hat"]
+    bt["pred_cal_pu"] = bt["share_cal_pu"] * bt["plan_m_hat"] * bt["level_hat"]
+    return bt
+
+
+def _blend(g, w, sfx):
+    """w = (вес бустинга, вес «бустинг × уровень», вес референсных месяцев)."""
+    return (w[0] * g[f"pred_model{sfx}"].to_numpy() + w[1] * g[f"pred_cal{sfx}"].to_numpy()
+            + w[2] * np.nan_to_num(g[f"pred_ref{sfx}"].to_numpy()))
+
+
+def tune(bt: pd.DataFrame, sfx: str = ""):
+    """Подбор весов и силы коррекции по средней |ошибке итога месяца| по всем дням месяца."""
+    results = {}
+    candidates = {M_REF: [(0, 0, 1)], M_BOOST: [(1, 0, 0)], M_CAL: [(0, 1, 0)],
+                  M_MIX: [w for w in MIX_GRID if max(w) < 1]}
+    for name, weights in candidates.items():
+        best = None
+        for w in weights:
+            errs = [np.abs(eom_errors(g["fact"].to_numpy(), _blend(g, w, sfx), ALPHAS)).mean(axis=1)
+                    for _, g in bt.groupby("ym")]
+            score = np.mean(errs, axis=0)  # по alpha
+            j = int(np.argmin(score))
+            if best is None or score[j] < best["score"]:
+                best = dict(w=w, alpha=float(ALPHAS[j]), score=float(score[j]))
+        results[name] = best
+    return results
+
+
+def evaluate(bt: pd.DataFrame, w, alpha: float, sfx: str = "") -> pd.DataFrame:
     rows = []
-    for m in lv.index:
-        g = by_month[m]
-        exp = preds[(m, m)] * lv.loc[m, "P"]
-        f = g["fact"].to_numpy()
-        for i in np.flatnonzero(exp > 0):
-            rows.append(dict(date=g["date"].iloc[i], ratio=f[i] / exp[i], share=f[i] / f.sum()))
-    an = pd.DataFrame(rows)
-    an = an[an["ratio"] > 2].sort_values("ratio", ascending=False).head(top)
-    if an.empty:
-        return
-    print("\n[5] Дни, где факт больше ожидания модели более чем вдвое (если это разовые суммы — внесите в EXCLUDE_DATES):")
-    print(pd.DataFrame({"дата": an["date"].dt.strftime("%d.%m.%Y %a"), "факт / ожидание": an["ratio"].round(1),
-                        "доля факта месяца": an["share"].map(lambda x: _apct(x, 1))}).to_string(index=False))
+    for m, g in bt.groupby("ym"):
+        a = g["fact"].to_numpy()
+        p = _blend(g, w, sfx)
+        ca = np.cumsum(a)
+        for k in range(len(a)):
+            path = nowcast_path(a, p, k, alpha)
+            mask = ca[k:] > 0
+            rows.append(dict(
+                ym=str(m), known_days=k,
+                err_eom=path[-1] / ca[-1] - 1,                                   # ошибка итога месяца
+                err_path=np.mean(np.abs(path[mask] / ca[k:][mask] - 1)),         # ошибка накопл. факта на даты
+                err_daily_wape=np.abs(p[k:] - a[k:]).sum() / max(a[k:].sum(), 1e-9)))
+    return pd.DataFrame(rows)
 
 
-def _fmt_money(x):
-    return f"{x:,.0f}".replace(",", " ")
+def debt_forecast_total(debt, prof, trend, k):
+    """Долг месяца (Σ за месяц или на последний день) при известных первых k днях — как в fill_series."""
+    known_sum, k_share = debt[:k].sum(), prof[:k].sum()
+    total = known_sum / k_share if k and k_share >= 0.25 else trend
+    rest = total * prof[k:]
+    if RR_DENOM == "last":
+        return rest[-1] if len(rest) else debt[-1]
+    return known_sum + rest.sum()
+
+
+def rr_evaluate(bt: pd.DataFrame, w, alpha: float, sfx: str = "") -> pd.DataFrame:
+    """Ошибка recovery rate месяца: прогноз факта / прогноз долга против факта / долга."""
+    rows = []
+    for m, g in bt.groupby("ym"):
+        a, debt = g["fact"].to_numpy(), g["debt"].to_numpy()
+        prof, trend = g["debt_prof"].to_numpy(), g["debt_trend"].iloc[0]
+        f_hat = eom_forecasts(a, _blend(g, w, sfx), [alpha])[0]
+        d_act = debt[-1] if RR_DENOM == "last" else debt.sum()
+        rr_act = a.sum() / d_act
+        for k in range(len(a)):
+            rr_hat = f_hat[k] / debt_forecast_total(debt, prof, trend, k)
+            rows.append(dict(ym=str(m), known_days=k, rr_fact=rr_act, rr_forecast=rr_hat, err_rr=rr_hat / rr_act - 1))
+    return pd.DataFrame(rows)
 
 
 # ============================================================================
-# РАБОЧИЙ ПРОГНОЗ
+# ПОЛНЫЙ ПРОГНОЗ НА МЕСЯЦЫ (по дням)
 # ============================================================================
-def production(ctx, origin, c, last_fact_date, cfg, best_name, tot, days):
-    q = (days[(days["method"] == best_name) & (days["k"] == FORECAST_ORIGIN)]
-         .groupby("day")["cum_err"].quantile([0.1, 0.9]).unstack())
-    mon = last_fact_date.to_period("M")  # месяц, по которому есть факт: сверяем с ним прогноз, сделанный заранее
-    jobs = []
-    if FORECAST_ORIGIN == 0:
-        mon_origin = (mon, 0)
-    else:
-        prev = mon - 1
-        mon_origin = (prev, prev.days_in_month + FORECAST_ORIGIN)
-    if (mon_origin[0], mon) in ctx["preds"] and mon in ctx["by_month"]:
-        jobs.append(("check", mon, *mon_origin))
-    for i in range(1, HORIZON_MONTHS + 1):
-        jobs.append(("forecast", mon + i, origin, c))
+def production(d, mt, cur, targets, use_debt, best, evals, rr_evals, winner, L, lvl_cfg):
+    feats = feature_list(use_debt)
+    ok = mt.index[mt["complete"] & mt["plan_known"]]
+    rate = mt["rate"].copy()
+    rr = mt["rr"].copy() if "rr" in mt else None
+    L = L.copy()
+    series = d["fact"].copy()  # факт; по мере прогноза дописываем прогноз (для recovery с начала данных)
+    months = sorted(set(t for t in targets if t < cur) |
+                    (set(pd.period_range(cur, max(targets), freq="M")) if max(targets) >= cur else set()))
+    models, out, summary = {}, [], []
 
-    out, summary = [], []
-    for kind, T, Op, cc in jobs:
-        case = build_case(T, Op, cc, ctx)
-        f = forecast_for(best_name, case, cfg)
-        p_hat = plan_forecast(case, cfg["plan"])
-        cf = np.cumsum(f)
-        a = case["actual"]
-        ca = np.where(np.isnan(a), np.nan, np.nancumsum(a))
-        qq = q.reindex(np.arange(1, len(f) + 1)).ffill().bfill()
-        rows = pd.DataFrame({"month": str(T), "date": case["dates"], "forecast": f, "cum_forecast": cf,
-                             "fact": a, "cum_fact": ca, "err_cum_pct": 100 * (cf / ca - 1),
-                             "corridor_low": cf / (1 + qq[0.9].to_numpy()), "corridor_high": cf / (1 + qq[0.1].to_numpy())})
-        out.append(rows)
-        k = case["k"]
-        e = tot[(tot["method"] == best_name) & (tot["k"] == max(k, min(ORIGIN_RANGE)))]["err_total"]
-        lo, hi = (cf[-1] / (1 + e.quantile(0.9)), cf[-1] / (1 + e.quantile(0.1))) if len(e) >= 5 else (np.nan, np.nan)
-        made = pd.Timestamp(Op.start_time) + pd.Timedelta(days=cc - 1) if cc > 0 else pd.Timestamp(Op.start_time) - pd.Timedelta(days=1)
-        summary.append({"месяц": str(T), "прогноз по факту на": f"{made:%d.%m.%Y}",
-                        "прогноз плана": _fmt_money(p_hat), "прогноз факта": _fmt_money(cf[-1]),
-                        "80% интервал факта": (f"{_fmt_money(lo)} – {_fmt_money(hi)}"
-                                               + (" (прибл.: дальше, чем бэктест)" if k < min(ORIGIN_RANGE) else ""))
-                        if np.isfinite(lo) else "—",
-                        "выполнение (к прогнозу плана)": _apct(cf[-1] / p_hat, 1)})
-        if kind == "check":
-            n = int(np.sum(~np.isnan(a)))
-            dev = cf[n - 1] / ca[n - 1] - 1
-            lo_d, hi_d = (q.loc[n, 0.1], q.loc[n, 0.9]) if n in q.index else (np.nan, np.nan)
-            ok = lo_d <= dev <= hi_d
-            print(f"\nПРОВЕРКА ПО ФАКТУ, {T}: прогноз сделан {made:%d.%m.%Y} (без плана и факта {T}), факт по "
-                  f"{pd.Timestamp(case['dates'][n - 1]):%d.%m.%Y}.")
-            print(f"  Накопленный прогноз {_fmt_money(cf[n - 1])}, факт {_fmt_money(ca[n - 1])}: ошибка {_pct(dev)}. "
-                  f"В бэктесте на {n}-й день у 80% месяцев ошибка была от {_pct(lo_d)} до {_pct(hi_d)} — "
-                  + ("в пределах обычного." if ok else "ВНЕ обычного коридора, стоит разобраться."))
-            if np.isfinite(case["plan_actual"]):
-                print(f"  План {T} оказался {_fmt_money(case['plan_actual'])}, прогноз плана был {_fmt_money(p_hat)} "
-                      f"({_pct(p_hat / case['plan_actual'] - 1)}).")
-    return pd.concat(out, ignore_index=True), pd.DataFrame(summary)
+    for T in months:
+        train_until = T if T < cur else cur   # прошедший месяц — модели, обученные только на месяцах до него
+        dd = attach_level(d, month_level_features(mt, rate, rr, use_debt))
+        if train_until not in models:
+            train = dd[(dd["ym"] < train_until) & dd["ym"].isin(ok) & dd["y"].notna()]
+            models[train_until] = (fit_model(train, train_until, feats),
+                                   fit_model(train, train_until, CAL_FEATURES + PLAN_FEATURES))
+        model, cal = models[train_until]
+        rows = dd[dd["ym"] == T].copy()
+        sc = "" if mt.loc[T, "plan_known"] else "_pu"
+        cfg = best[sc][winner]
+        w = cfg["w"]
+        refs = [m for m in ok if m < min(T, cur)][-N_REF_MONTHS:]
+        plan_m = rows["plan_m"].iloc[0]
+        share_cal = predict_share(cal, rows)
+        level_hat = level_estimate(L, T, lvl_cfg["h"], lvl_cfg["w0"])
+        p = plan_m * (w[0] * predict_share(model, rows) + w[1] * share_cal * level_hat
+                      + w[2] * np.nan_to_num(reference_curve(d, T, refs)))   # прогноз без факта месяца
+        a = rows["fact"].to_numpy()
+        k = int(np.sum(~np.isnan(a)))
+        cum = np.r_[np.cumsum(a[:k]), nowcast_path(np.nan_to_num(a), p, k, cfg["alpha"])]
+        fc = np.diff(np.r_[0.0, cum])
+        series.loc[(d["ym"] == T).to_numpy()] = fc
+        if T >= cur:   # уровень следующих месяцев — с учётом прогноза этого
+            rate.loc[T] = cum[-1] / plan_m
+            L.loc[T] = cum[-1] / (share_cal.sum() * plan_m)
+            if rr is not None:
+                rr.loc[T] = cum[-1] / mt.loc[T, "debt_m"]
+
+        out_rows = pd.DataFrame({
+            "month": str(T), "date": rows["date"].to_numpy(), "is_workday": rows["is_workday"].to_numpy(),
+            "plan": rows["plan"].to_numpy(), "plan_is_forecast": rows["plan_actual"].isna().to_numpy(),
+            "fact": a, "model_forecast": p, "forecast": fc, "is_forecast": np.arange(len(a)) >= k,
+            "cum_plan": np.cumsum(rows["plan"].to_numpy()), "cum_fact": np.where(np.isnan(a), np.nan, np.nancumsum(a)),
+            "cum_model_forecast": np.cumsum(p), "cum_forecast": cum})
+        out_rows["completion_pct"] = 100 * out_rows["cum_forecast"] / out_rows["cum_plan"].replace(0, np.nan)
+        out_rows["model_err_pct"] = 100 * (out_rows["cum_model_forecast"] / out_rows["cum_fact"] - 1)  # проверка по факту
+
+        e = evals[sc][winner]
+        e = e.loc[e["known_days"] == min(k, e["known_days"].max()), "err_eom"] if k < len(a) else pd.Series(dtype=float)
+        lo, hi = (cum[-1] / (1 + e.quantile(0.9)), cum[-1] / (1 + e.quantile(0.1))) if len(e) >= 5 else (np.nan, np.nan)
+        s = {"месяц": str(T), "дней факта": f"{k} из {len(a)}",
+             "план": f"{plan_m:,.0f}".replace(",", " ") + (" (прогноз)" if sc else ""),
+             "прогноз факта": f"{cum[-1]:,.0f}".replace(",", " "),
+             "выполнение": f"{100 * cum[-1] / plan_m:.1f}%",
+             "80% интервал выполнения": (f"{100 * lo / plan_m:.1f}% – {100 * hi / plan_m:.1f}%" if np.isfinite(lo) else "—")}
+
+        if "debt" in d:
+            debt = rows["debt"].to_numpy()
+            hist = (d["date"] < rows["date"].iloc[0]).to_numpy()
+            f_before, d_before = series[hist].sum(), d.loc[hist, "debt"].sum()
+            out_rows["debt"] = debt
+            out_rows["debt_is_forecast"] = rows["debt_actual"].isna().to_numpy()
+            out_rows["rr_day_pct"] = 100 * fc / debt
+            cum_debt = np.cumsum(debt) if RR_DENOM == "sum" else debt
+            tot_debt = d_before + np.cumsum(debt) if RR_DENOM == "sum" else debt
+            out_rows["rr_cum_month_pct"] = 100 * cum / cum_debt
+            out_rows["rr_cum_total_pct"] = 100 * (f_before + cum) / tot_debt
+            rr_m = cum[-1] / cum_debt[-1]
+            s["recovery месяца"] = f"{100 * rr_m:.3f}%" + (" (долг — прогноз)" if out_rows["debt_is_forecast"].any() else "")
+            re = rr_evals[sc][winner]
+            re = re.loc[re["known_days"] == min(k, re["known_days"].max()), "err_rr"] if k < len(a) else pd.Series(dtype=float)
+            s["80% интервал recovery"] = "—"
+            if len(re) >= 5:
+                s["80% интервал recovery"] = f"{100 * rr_m / (1 + re.quantile(0.9)):.3f}% – {100 * rr_m / (1 + re.quantile(0.1)):.3f}%"
+        if T in targets:
+            out.append(out_rows)
+            summary.append(s)
+    return pd.concat(out, ignore_index=True), pd.DataFrame(summary), models.get(cur, (None,))[0]
 
 
 # ============================================================================
 # ГРАФИКИ
 # ============================================================================
 INK, INK2, GRID, SURFACE = "#0b0b0b", "#52514e", "#e4e3df", "#fcfcfb"
-SERIES = {M_FULL: "#2a78d6", M_FACT: "#eb6834", M_REF: "#1baf7a"}
+BLUE, ORANGE, AQUA = "#2a78d6", "#eb6834", "#1baf7a"
 
 
 def _style(ax):
@@ -696,52 +770,48 @@ def _style(ax):
     ax.set_axisbelow(True)
 
 
-def plot_backtest(days, path):
+def plot_backtest(curves: dict, path: str):
+    """curves: {подпись: (Series ошибки по known_days, цвет, стиль линии)}"""
     import matplotlib.pyplot as plt
-    d0 = days[days["k"] == FORECAST_ORIGIN]
     fig, ax = plt.subplots(figsize=(9, 4.5), facecolor=SURFACE)
     _style(ax)
-    for name in METHODS:
-        s = d0[d0["method"] == name].groupby("day")["cum_err"].apply(lambda x: x.abs().mean())
-        ax.plot(s.index, 100 * s.values, color=SERIES[name], linewidth=2, label=name)
-    ax.set_yscale("log")
-    from matplotlib.ticker import FixedLocator, FuncFormatter, NullLocator
-    ax.yaxis.set_major_locator(FixedLocator([0.5, 1, 2, 5, 10, 20, 50, 100]))
-    ax.yaxis.set_minor_locator(NullLocator())
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}%"))
-    ax.axhline(1, color=INK2, linewidth=1, linestyle=(0, (4, 3)))
-    ax.set_xlabel("День месяца", color=INK2)
-    ax.set_ylabel("Средняя |ошибка| накопленного факта (лог. шкала)", color=INK2)
-    ax.set_title(f"Бэктест: прогноз {_k_label(FORECAST_ORIGIN)}, сверка с фактом на каждую дату",
-                 color=INK, loc="left", fontsize=12)
+    for name, (s, color, ls) in curves.items():
+        ax.plot(s.index, 100 * s.values, color=color, linewidth=2, linestyle=ls, label=name)
+    ax.axhline(1, color=INK2, linewidth=1, linestyle=(0, (1, 2)))
+    ax.annotate("цель 1%", (0, 1), xytext=(2, 4), textcoords="offset points", color=INK2, fontsize=9)
+    ax.set_xlabel("Сколько дней месяца уже известно", color=INK2)
+    ax.set_ylabel("Средняя |ошибка| итога месяца, %", color=INK2)
+    ax.set_title("Бэктест: ошибка прогноза итога месяца", color=INK, loc="left", fontsize=12)
     ax.legend(frameon=False, fontsize=9, labelcolor=INK2)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
 
 
-def plot_forecast(fc, path):
+def plot_month(g: pd.DataFrame, path: str):
+    """Выполнение плана на дату и (если есть долг) recovery rate на дату: факт — сплошная, прогноз — пунктир."""
     import matplotlib.dates as mdates
     import matplotlib.pyplot as plt
-    months = list(dict.fromkeys(fc["month"]))[:2]
-    fig, axes = plt.subplots(1, len(months), figsize=(5.5 * len(months), 4.5), facecolor=SURFACE)
+    panels = [("completion_pct", "Выполнение плана на дату, %")]
+    if "rr_cum_month_pct" in g:
+        panels.append(("rr_cum_month_pct", "Recovery rate с начала месяца, %"))
+    fig, axes = plt.subplots(1, len(panels), figsize=(5.5 * len(panels), 4.2), facecolor=SURFACE)
     axes = np.atleast_1d(axes)
-    color = SERIES[M_FULL]
-    for ax, m in zip(axes, months):
+    known = g[~g["is_forecast"]]
+    fut = g[g["is_forecast"]]
+    if len(known) and len(fut):
+        fut = pd.concat([known.tail(1), fut])
+    for ax, (col, title) in zip(axes, panels):
         _style(ax)
-        g = fc[fc["month"] == m]
-        ax.fill_between(g["date"], g["corridor_low"] / 1e6, g["corridor_high"] / 1e6, color=color, alpha=0.12,
-                        linewidth=0, label="Коридор для факта (80% месяцев бэктеста)")
-        ax.plot(g["date"], g["cum_forecast"] / 1e6, color=color, linewidth=2, linestyle=(0, (4, 3)), label="Прогноз")
-        if g["cum_fact"].notna().any():
-            ax.plot(g["date"], g["cum_fact"] / 1e6, color=INK, linewidth=2, label="Факт")
+        if len(known):
+            ax.plot(known["date"], known[col], color=INK, linewidth=2, label="Факт")
+        if len(fut):
+            ax.plot(fut["date"], fut[col], color=BLUE, linewidth=2, linestyle=(0, (4, 3)), label="Прогноз")
         ax.set_xlim(g["date"].min() - pd.Timedelta(hours=12), g["date"].max() + pd.Timedelta(hours=12))
         ax.xaxis.set_major_locator(mdates.DayLocator(bymonthday=[1, 8, 15, 22, 29]))
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m"))
-        has_fact = g["cum_fact"].notna().any()
-        ax.set_title(f"{m}: " + ("прогноз против факта" if has_fact else "прогноз"), color=INK, loc="left", fontsize=11)
-        ax.set_ylabel("Накопленный факт, млн", color=INK2)
-        ax.legend(frameon=False, fontsize=8, labelcolor=INK2, loc="upper left")
+        ax.set_title(f"{g['month'].iloc[0]}: {title}", color=INK, loc="left", fontsize=11)
+        ax.legend(frameon=False, fontsize=9, labelcolor=INK2)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -750,88 +820,126 @@ def plot_forecast(fc, path):
 # ============================================================================
 # ЗАПУСК
 # ============================================================================
+def _summary_table(best, evals):
+    def w_str(w):
+        return " / ".join(f"{x:g}" for x in w)
+    return pd.DataFrame({
+        name: {
+            "веса: бустинг / ×уровень / реф.": w_str(cfg["w"]), "alpha": cfg["alpha"],
+            **{f"итог, известно {k} дн.": f"{100 * evals[name].groupby('known_days')['err_eom'].apply(lambda s: s.abs().mean()).get(k, np.nan):.2f}%"
+               for k in REPORT_KNOWN_DAYS},
+            "на даты, с начала мес.": f"{100 * evals[name].query('known_days == 0')['err_path'].mean():.2f}%",
+            "дневной WAPE": f"{100 * evals[name].query('known_days == 0')['err_daily_wape'].mean():.1f}%",
+        } for name, cfg in best.items()})
+
+
+def _hl(h):
+    return "без роста" if h == 0 else ("среднее за всю историю" if np.isinf(h) else "полураспад %g мес." % h)
+
+
 def run(df: pd.DataFrame, last_fact_date=LAST_FACT_DATE, make_plots=True):
-    d, mt, last_fact_date = prepare(df, last_fact_date)
-    origin = (last_fact_date + pd.Timedelta(days=1)).to_period("M")   # первый месяц без полного факта
-    c = (last_fact_date + pd.Timedelta(days=1)).day - 1                # сколько дней этого месяца известно
-    train_months = [m for m in mt.index[mt["complete"] & mt["plan_full"]] if m < origin]
-    print(f"Данные: {d.loc[d['fact'].notna(), 'date'].min():%d.%m.%Y} – {last_fact_date:%d.%m.%Y}; "
-          f"план известен по {mt.index[mt['plan_full']].max()} включительно")
+    d, last_fact_date, cur, targets = prepare(df, last_fact_date)
+    has_debt = "debt" in d
+    print(f"Данные: {d['date'].min():%d.%m.%Y} – {last_fact_date:%d.%m.%Y} (факт); "
+          f"план загружен по {full_months(d, 'plan').index.max()}"
+          + (f"; долг известен по {d.loc[d['debt_actual'].notna(), 'date'].max():%d.%m.%Y}" if has_debt else ""))
 
-    print("Обучение моделей шаг за шагом (каждая — только на прошлом)...")
-    pb, pg, by_month = walk_forward(d, train_months, origin)
+    # прогноз плана (и долга) там, где их ещё нет
+    plan_cfg = tune_series(d, "plan")
+    d["plan"] = fill_series(d, "plan", plan_cfg)
+    print(f"Прогноз плана, когда он не загружен: последний месяц ({plan_cfg['unit']}) × темп роста ({_hl(plan_cfg['h'])}), "
+          f"раскладка {plan_cfg['profile']}. На прошлых месяцах ошибка итога плана {100 * plan_cfg['total_err']:.2f}%, "
+          f"раскладки по дням {100 * plan_cfg['profile_err']:.1f}% (WAPE).")
+    debt_cfg = None
+    if has_debt:
+        debt_cfg = tune_series(d, "debt")
+        d["debt"] = fill_series(d, "debt", debt_cfg)
+        print(f"Прогноз долга на будущие дни: на прошлых месяцах ошибка итога {100 * debt_cfg['total_err']:.2f}%.")
+    d = add_plan_features(d)
+    mt = month_table(d, last_fact_date)
+    d["y"] = np.where(d["ym"].map(mt["plan_known"]).astype(bool), d["fact"] / d["plan_m"].replace(0, np.nan), np.nan)
 
-    variants = {}
-    for wb in CALENDAR_BLENDS:  # календарная модель: GLM, бустинг или смесь — выбирает бэктест
-        preds = {key: wb * pb[key] + (1 - wb) * pg[key] for key in pb}
-        lv = level_history(preds, by_month, mt, train_months)
-        ctx = dict(preds=preds, by_month=by_month, lv=lv, mt=mt, train_months=train_months)
-        cases = backtest_cases(ctx)
-        cfg = tune(cases)
-        tot, days = evaluate(cases, cfg)
-        score = tot.groupby("method")["err_total"].apply(lambda s: s.abs().mean())
-        variants[wb] = dict(ctx=ctx, lv=lv, cfg=cfg, tot=tot, days=days, score=score)
-    wb = min(variants, key=lambda w: variants[w]["score"].min())
-    v = variants[wb]
-    ctx, lv, cfg, tot, days = v["ctx"], v["lv"], v["cfg"], v["tot"], v["days"]
-    best_name = v["score"].idxmin()
+    print("Бэктест...")
+    bt = backtest(d, mt, plan_cfg, debt_cfg)
+    lvl_cfg, L = tune_level(bt)
+    bt = add_level_method(bt, lvl_cfg, L)
+    print(f"\nУровень для «{M_CAL}»: " + ("не подстраивается" if np.isinf(lvl_cfg["w0"]) else
+          f"сглаживание ({_hl(lvl_cfg['h'])}), тяга к среднему {lvl_cfg['w0']:g}"))
 
-    cal_name = lambda w: "GLM" if w == 0 else ("бустинг" if w == 1 else f"смесь ({100 * w:.0f}% бустинга)")
-    comp = pd.DataFrame({cal_name(w): variants[w]["score"].reindex(list(METHODS)).map(_apct) for w in variants}).T
-    print("\nКалендарная модель: средняя |ошибка| итога месяца по всем моментам прогноза бэктеста")
-    print(comp.to_string())
-    print(f"Выбрано: {cal_name(wb)}")
+    use_debt = False
+    if has_debt:  # признаки долга в бустинге — только если они уменьшают ошибку
+        s0 = tune(bt)[M_BOOST]["score"]
+        bt_debt = bt.copy()
+        bt_debt["pred_model"], bt_debt["pred_model_pu"] = bt["pred_model_debt"], bt["pred_model_debt_pu"]
+        s1 = tune(bt_debt)[M_BOOST]["score"]
+        use_debt = s1 < s0
+        print(f"Признаки долга в бустинге: средняя ошибка итога без них {100 * s0:.2f}%, с ними {100 * s1:.2f}% "
+              f"→ {'оставляем' if use_debt else 'не используем'}.")
+        if use_debt:
+            bt = bt_debt
 
-    p, lvc = cfg["plan"], cfg["level"]
+    best = {sfx: tune(bt, sfx) for sfx in SCENARIOS}
+    evals = {sfx: {n: evaluate(bt, c["w"], c["alpha"], sfx) for n, c in best[sfx].items()} for sfx in SCENARIOS}
+    for sfx, label in SCENARIOS.items():
+        print(f"\nСредняя |ошибка| (бэктест), {label}:")
+        print(_summary_table(best[sfx], evals[sfx]).to_string())
 
-    def hh(h):
-        return "без роста" if h == 0 else ("средний за всю историю" if np.isinf(h) else "полураспад %g мес." % h)
+    winner = min(best[""], key=lambda n: best[""][n]["score"])
+    ev = evals[""][winner]
+    by_month = (ev[ev["known_days"].isin(REPORT_KNOWN_DAYS)]
+                .pivot(index="ym", columns="known_days", values="err_eom").mul(100).round(2))
+    pe = bt.groupby("ym").agg(hat=("plan_m_hat", "first"), act=("plan_m", "first"))
+    by_month["ошибка прогноза плана"] = (100 * (pe["hat"] / pe["act"] - 1)).rename(index=str).round(2)
+    print(f"\nЛучший: {winner}. Ошибка итога месяца по месяцам, план загружен, % (столбцы — сколько дней известно; "
+          f"+ значит прогноз выше факта). Последний столбец — насколько ошибся бы прогноз плана:")
+    print(by_month.to_string())
 
-    unit = "в день" if p["unit"] == "день" else "за месяц"
-    if np.isinf(lvc["w0"]):
-        lvl_txt = "не подстраивается"
-    else:
-        smooth = "без затухания" if np.isinf(lvc["h"]) else "полураспад %g мес." % lvc["h"]
-        lvl_txt = "сглаживание %s, тяга к среднему %g, вес неполного месяца %g" % (smooth, lvc["w0"], lvc["gain"])
-    print(f"\nПодобрано по бэктесту: план — последний известный ({unit}) × темп роста ({hh(p['h'])}); "
-          f"тренд факта — {hh(cfg['fact_h'])}; уровень — {lvl_txt}")
+    rr_evals = {}
+    if has_debt:
+        rr_evals = {sfx: {n: rr_evaluate(bt, c["w"], c["alpha"], sfx) for n, c in best[sfx].items()} for sfx in SCENARIOS}
+        tab = {}
+        for sfx, label in SCENARIOS.items():
+            r = rr_evals[sfx][winner]
+            tab[label] = {f"известно {k} дн.": f"{100 * r.loc[r['known_days'] == k, 'err_rr'].abs().mean():.2f}%"
+                          for k in REPORT_KNOWN_DAYS}
+        print(f"\nRecovery rate месяца ({winner}): средняя |относительная ошибка| (долг на неизвестные дни — прогноз):")
+        print(pd.DataFrame(tab).T.to_string())
 
-    report_backtest(tot, days, best_name)
-    report_level(lv)
-    report_anomalies(ctx["preds"], by_month, lv)
-
-    print(f"\nЛучший по ошибке итога месяца: {best_name}")
-    fc, fsum = production(ctx, origin, c, last_fact_date, cfg, best_name, tot, days)
+    fc, fsum, model = production(d, mt, cur, targets, use_debt, best, evals, rr_evals, winner, L, lvl_cfg)
     print("\nПрогноз:")
     print(fsum.to_string(index=False))
 
-    fc.to_csv(f"{OUT_DIR}/forecast_daily.csv", index=False)
-    days[days["method"].isin([best_name, M_REF])].to_csv(f"{OUT_DIR}/backtest_daily.csv", index=False)
-    tot.to_csv(f"{OUT_DIR}/backtest_months.csv", index=False)
+    if model is not None and hasattr(model, "feature_importances_"):
+        imp = pd.Series(model.feature_importances_, index=model.feats_).sort_values(ascending=False)
+        print("\nВажность признаков бустинга (топ-12):")
+        print(imp.head(12).round(1).to_string())
+
+    for m, g in fc.groupby("month"):
+        g.to_csv(f"{OUT_DIR}/forecast_{m}.csv", index=False, encoding="utf-8-sig")
+        if make_plots:
+            plot_month(g, f"{OUT_DIR}/forecast_{m}.png")
+    ev.to_csv(f"{OUT_DIR}/backtest_errors.csv", index=False)
     if make_plots:
-        plot_backtest(days, f"{OUT_DIR}/backtest_by_date.png")
-        plot_forecast(fc, f"{OUT_DIR}/forecast_vs_fact.png")
-    return dict(daily=d, months=mt, level=lv, cfg=cfg, calendar_blend=wb, backtest_months=tot, backtest_daily=days,
-                best=best_name, forecast=fc, forecast_summary=fsum, variants=variants)
+        def curve(sfx, name):
+            return evals[sfx][name].groupby("known_days")["err_eom"].apply(lambda s: s.abs().mean())
+        curves = {f"{winner}, план загружен": (curve("", winner), BLUE, "-"),
+                  f"{winner}, план ещё не загружен": (curve("_pu", winner), BLUE, (0, (4, 3)))}
+        if winner != M_BOOST:
+            curves[f"{M_BOOST} (первая версия), план загружен"] = (curve("", M_BOOST), AQUA, "-")
+        curves[f"{M_REF}, план загружен"] = (curve("", M_REF), ORANGE, "-")
+        plot_backtest(curves, f"{OUT_DIR}/backtest_error_by_day.png")
+    return dict(daily=d, months=mt, backtest=bt, best=best, evals=evals, rr_evals=rr_evals, winner=winner,
+                use_debt=use_debt, plan_cfg=plan_cfg, debt_cfg=debt_cfg, level_cfg=lvl_cfg, level=L,
+                by_month=by_month, forecast=fc, forecast_summary=fsum, model=model)
 
 
 def load_data() -> pd.DataFrame:
-    """Замените на свой запрос. Нужны колонки DATE_COL, FACT_COL, PLAN_COL."""
+    """Замените на свой запрос. Нужны колонки DATE_COL, FACT_COL, PLAN_COL (и DEBT_COL, если задан)."""
     # import sqlalchemy as sa
     # engine = sa.create_engine("...")
-    # return pd.read_sql("select pay_date as date, fact, plan from ...", engine)
+    # return pd.read_sql("select pay_date as date, fact, plan, debt from ...", engine)
     raise NotImplementedError("Заполните load_data() своим запросом к базе")
 
 
 if __name__ == "__main__":
     res = run(load_data())
-
-# ----------------------------------------------------------------------------
-# Если в [3] большая «ошибка уровня», а в [4] скачки L заметно больше 1%, по трём колонкам точнее не станет.
-# Что обычно объясняет уровень заранее (добавляется отдельным слагаемым или признаком уровня):
-#   - досрочные погашения отдельно от плановых платежей: они не привязаны к плану и сильнее всего «шумят»;
-#   - просроченная задолженность на начало месяца по корзинам: сборы с просрочки зависят от неё, а не от плана;
-#   - разбивка по продуктам / сегментам: у каждого свой уровень, итог = сумма прогнозов.
-# Если большая «ошибка плана» — план следующего месяца лучше брать из графика платежей по действующим договорам
-# (он известен заранее), а не экстраполировать.
-# ----------------------------------------------------------------------------
