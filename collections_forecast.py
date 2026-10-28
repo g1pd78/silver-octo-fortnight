@@ -46,6 +46,10 @@
   + прогноз остатка с поправкой по факту на сегодня; накопленные суммы; эффективность на дату (eff_*_pct) и разница
   прогноза с фактом (eff_diff_pp); recovery rate, если задан DEBT_COL. В сводке — эффективность на конец месяца
   с 80% интервалом из честного бэктеста. backtest_errors.csv — честный бэктест по месяцам и дням.
+  effectiveness.xlsx — всё в Excel, в формате треугольника: строки — месяцы, столбцы — числа месяца 1–31, в ячейке —
+  эффективность на эту дату. Листы: «Эффективность» (факт, где его ещё нет — прогноз), «Прогноз с 1-го числа»,
+  «Разница с фактом» (по дням, п.п.), «Итог месяца по мере факта» (прогноз на конец месяца, когда известно k дней),
+  сводки и прогноз по дням.
 
 ВХОД
   DataFrame с колонками дата / факт / план [/ «к оплате»] [/ продукт] — значения ЗА ДЕНЬ. Будущие даты факта не нужны.
@@ -65,6 +69,7 @@
 для черновых прогонов); run_segments — столько же на каждый продукт и на итог.
 """
 
+import datetime
 import itertools
 import warnings
 
@@ -105,6 +110,7 @@ DUE_LAGS = range(-7, 8)        # модели от «к оплате»: опла
 PROFILE_MONTHS = 6             # по скольким последним месяцам раскладывать прогноз плана/«к оплате» по дням
 TREND_HALFLIVES = (0, 1, 3, 6, 12, np.inf)  # темп роста: 0 = без роста, иначе полураспад весов, мес.
 OUT_DIR = "."
+EXCEL = True                   # выгружать результаты в Excel с треугольниками эффективности (нужен openpyxl)
 RANDOM_STATE = 42
 N_SEEDS = 5                    # сколько бустингов с разными seed усреднять (1 — быстрее, но прогноз «дрожит»)
 
@@ -1008,7 +1014,7 @@ def production(d, mt, cur, targets, sel, hist, hon):
     series = d["fact"].copy()  # факт; по мере прогноза дописываем прогноз (для recovery с начала данных)
     months = sorted(set(t for t in targets if t < cur) |
                     (set(pd.period_range(cur, max(targets), freq="M")) if max(targets) >= cur else set()))
-    models, out, summary = {}, [], []
+    models, out, summary, dev = {}, [], [], {}
 
     for T in months:
         train_until = T if T < cur else cur   # прошедший месяц — модели, обученные только на месяцах до него
@@ -1073,7 +1079,9 @@ def production(d, mt, cur, targets, sel, hist, hon):
         if T in targets:
             out.append(o)
             summary.append(s)
-    return pd.concat(out, ignore_index=True), pd.DataFrame(summary), models
+            # прогноз итога месяца, сделанный при k = 0, 1, … известных днях (по сегодня) — для Excel
+            dev[T] = nowcast_paths(np.nan_to_num(a), p, ch["nc"])[:min(k, n - 1) + 1, -1]
+    return pd.concat(out, ignore_index=True), pd.DataFrame(summary), models, dev
 
 
 # ============================================================================
@@ -1211,9 +1219,291 @@ def _curve(h: pd.DataFrame, name: str) -> pd.Series:
 
 
 # ============================================================================
+# ВЫГРУЗКА В EXCEL: ТРЕУГОЛЬНИКИ ЭФФЕКТИВНОСТИ
+# ============================================================================
+XL_PCT, XL_PP, XL_MONEY, XL_DATE = "0.0%", "+0.00;-0.00;0.00", "#,##0", "DD.MM.YYYY"
+XL_DAILY = {"month": "месяц", "date": "дата", "is_workday": "рабочий день", "has_fact": "факт есть", "plan": "план",
+            "plan_is_forecast": "план — прогноз", "fact": "факт", "forecast": "прогноз без факта месяца",
+            "fact_plus_forecast": "факт + прогноз остатка", "cum_plan": "план с начала месяца",
+            "cum_fact": "факт с начала месяца", "cum_forecast": "прогноз с начала месяца",
+            "cum_fact_plus_forecast": "факт + прогноз с начала месяца", "eff_fact_pct": "эфф. факт, %",
+            "eff_forecast_pct": "эфф. прогноз, %", "eff_fact_plus_forecast_pct": "эфф. факт + прогноз, %",
+            "eff_diff_pp": "прогноз − факт, п.п.", "forecast_err_pct": "ошибка прогноза суммы, %"}
+
+
+def _day_table(dates, values) -> pd.DataFrame:
+    """Строки — месяцы, столбцы — числа месяца 1..31."""
+    dt = pd.DatetimeIndex(pd.to_datetime(dates))
+    t = pd.DataFrame({"ym": dt.to_period("M").astype(str), "day": dt.day, "v": np.asarray(values, dtype=float)})
+    return t.pivot(index="ym", columns="day", values="v").reindex(columns=range(1, 32))
+
+
+def _xl(v):
+    """Значение для ячейки Excel."""
+    if isinstance(v, (list, tuple, np.ndarray)):
+        return str(v)
+    if v is None or (not isinstance(v, str) and pd.isna(v)):
+        return None
+    if isinstance(v, (pd.Timestamp, np.datetime64)):
+        return pd.Timestamp(v).to_pydatetime()
+    if isinstance(v, (bool, np.bool_)):
+        return bool(v)
+    if isinstance(v, np.integer):
+        return int(v)
+    if isinstance(v, (float, np.floating)):
+        return float(v) if np.isfinite(v) else None
+    return v if isinstance(v, (str, int)) else str(v)
+
+
+def _put_table(ws, df: pd.DataFrame, r0: int, title=None, note=None, fmt=None, style=None, index=True) -> int:
+    """Таблица на лист с строки r0: заголовок, пояснение, шапка, строки. fmt(столбец) — формат чисел столбца,
+    style(строка, столбец, значение) — (заливка, шрифт, формат) ячейки. Возвращает следующую свободную строку."""
+    from openpyxl.styles import Alignment, Font, PatternFill
+    r = r0
+    if title:
+        ws.cell(r, 1, title).font = Font(bold=True, size=12)
+        r += 1
+    if note:
+        ws.cell(r, 1, note).font = Font(italic=True, color="52514E")
+        r += 1
+    head_font, head_fill = Font(bold=True), PatternFill("solid", fgColor="E9E9E6")
+    head_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    names = ([df.index.name or ""] if index else []) + [str(c) for c in df.columns]
+    for j, name in enumerate(names, start=1):
+        c = ws.cell(r, j, name)
+        c.font, c.fill, c.alignment = head_font, head_fill, head_align
+    c0 = 2 if index else 1
+    for i, (idx, row) in enumerate(df.iterrows(), start=r + 1):
+        if index:
+            ws.cell(i, 1, _xl(idx)).font = Font(bold=True)
+        for j, col in enumerate(df.columns, start=c0):
+            c = ws.cell(i, j, _xl(row[col]))
+            f = fmt(col) if fmt else None
+            if isinstance(c.value, datetime.datetime):
+                f = XL_DATE
+            if style:
+                fill, font, f2 = style(idx, col, row[col])
+                if fill is not None:
+                    c.fill = fill
+                if font is not None:
+                    c.font = font
+                f = f2 or f
+            if f:
+                c.number_format = f
+    return r + len(df) + 2
+
+
+def _err_fill(st: dict, e):
+    """Заливка по |разнице| в п.п.: ≤ 1 — зелёная, ≤ 2 — жёлтая, больше — красная."""
+    if e is None or not np.isfinite(e):
+        return None
+    return st["ok"] if abs(e) <= 1 else (st["mid"] if abs(e) <= 2 else st["bad"])
+
+
+def export_excel(path: str, daily: pd.DataFrame, fc: pd.DataFrame, fsum: pd.DataFrame, paths: dict, bt: dict,
+                 dev: dict, tables: list):
+    """Excel в формате треугольника: строки — месяцы, столбцы — числа месяца 1..31, в ячейке — эффективность на эту
+    дату (факт с начала месяца / план с начала месяца).
+      daily  — дата, план, факт по всем месяцам (факт пустой, где его ещё нет);
+      fc     — прогноз по дням на прогнозные месяцы (production), fsum — сводка по ним;
+      paths  — честный бэктест «Авто»: {месяц: накопленный прогноз [k известных дней, день]};
+      bt     — {месяц: (план по дням, факт по дням, даты)} для месяцев бэктеста;
+      dev    — {месяц: прогноз итога месяца в деньгах при k = 0, 1, … известных днях} для прогнозных месяцев;
+      tables — [(лист, [(заголовок, таблица), …]), …] — сводки."""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        print("Excel не записан: нужен пакет openpyxl (pip install openpyxl).")
+        return
+    st = dict(fc_fill=PatternFill("solid", fgColor="DCEBFA"), fc_font=Font(color="1F5FAD", italic=True),
+              none=PatternFill("solid", fgColor="F2F2F2"), ok=PatternFill("solid", fgColor="D9F2E3"),
+              mid=PatternFill("solid", fgColor="FFF2CC"), bad=PatternFill("solid", fgColor="F8D7D3"))
+    days = list(range(1, 32))
+
+    def dim(m):
+        return pd.Period(m, "M").days_in_month if m[:1].isdigit() else 31
+
+    def is_day(col):
+        return isinstance(col, (int, np.integer))
+
+    fcm = {m: o for m, o in fc.groupby("month", sort=False)}
+    bt_keys = [str(m) for m in sorted(paths)]
+    btd = {str(m): v for m, v in bt.items()}
+    wb = Workbook()
+
+    # 1. Эффективность на каждую дату: факт, где его ещё нет — прогноз
+    d = daily.copy()
+    d["ym"] = d["date"].dt.to_period("M").astype(str)
+    g = d.groupby("ym")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        eff = (g["fact"].cumsum() / g["plan"].cumsum().replace(0, np.nan)).to_numpy()
+    E = _day_table(d["date"], eff)
+    F = pd.DataFrame(False, index=E.index, columns=days)
+    status, end, plan_m = {}, {}, g["plan"].sum()
+    full = g["fact"].count() == g.size()
+    for m in E.index:
+        if m not in fcm and full.get(m, False):
+            status[m], end[m] = "факт", g["fact"].sum()[m] / plan_m[m]
+    for m, o in fcm.items():
+        k = int(o["has_fact"].sum())
+        E.loc[m] = _day_table(o["date"], o["eff_fact_plus_forecast_pct"] / 100).loc[m]
+        F.loc[m] = _day_table(o["date"], ~o["has_fact"]).loc[m].fillna(0).astype(bool)
+        status[m] = ("факт" if k == len(o) else "прогноз" if k == 0
+                     else f"факт по {pd.Timestamp(o['date'].iloc[k - 1]):%d.%m}, дальше прогноз")
+        status[m] += " (план — прогноз)" if o["plan_is_forecast"].any() else ""
+        end[m] = o["fact_plus_forecast"].sum() / o["plan"].sum()
+        plan_m[m] = o["plan"].sum()
+    E = E.sort_index()
+    F = F.reindex(E.index, fill_value=False)
+    interval = dict(zip(fsum["месяц"].astype(str), fsum["80% интервал"])) if len(fsum) else {}
+    T1 = pd.concat([pd.Series(status, name="Статус").reindex(E.index), E,
+                    pd.Series(end, name="На конец месяца").reindex(E.index),
+                    pd.Series(interval, name="80% интервал").reindex(E.index),
+                    plan_m.rename("План месяца").reindex(E.index)], axis=1)
+    T1.index.name = "Месяц"
+
+    def s1(idx, col, v):
+        if is_day(col):
+            if col > dim(idx):
+                return st["none"], None, None
+            if F.loc[idx, col]:
+                return st["fc_fill"], st["fc_font"], None
+        elif col == "На конец месяца" and idx in fcm and F.loc[idx].any():
+            return st["fc_fill"], st["fc_font"], None
+        return None, None, None
+
+    ws = wb.active
+    ws.title = "Эффективность"
+    _put_table(ws, T1, 1, title="Эффективность на дату: факт с начала месяца / план с начала месяца",
+               note="Чёрным — факт, синим на голубом — прогноз (факт по сегодня + прогноз остатка с поправкой). "
+                    "Столбцы 1–31 — число месяца.",
+               fmt=lambda c: XL_PCT if is_day(c) or c == "На конец месяца" else (XL_MONEY if c == "План месяца" else None),
+               style=s1)
+
+    # 2. Прогноз, сделанный до начала месяца (без его факта)
+    rows, ends = [], {}
+    for m in bt_keys:
+        plan, fact, dates = btd[m]
+        f0 = paths[pd.Period(m, "M")][0]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rows.append(_day_table(dates, f0 / np.cumsum(plan)))
+        ends[m] = (f0[-1] / plan.sum(), fact.sum() / plan.sum())
+    for m, o in fcm.items():
+        if m in ends:
+            continue
+        rows.append(_day_table(o["date"], o["eff_forecast_pct"] / 100))
+        ends[m] = (o["forecast"].sum() / o["plan"].sum(),
+                   o["fact"].sum() / o["plan"].sum() if o["has_fact"].all() else np.nan)
+    if rows:
+        P1 = pd.concat(rows)
+        P1["Прогноз на конец"] = [ends[m][0] for m in P1.index]
+        P1["Факт на конец"] = [ends[m][1] for m in P1.index]
+        P1["Разница, п.п."] = 100 * (P1["Прогноз на конец"] - P1["Факт на конец"])
+        P1.index.name = "Месяц"
+        ws = wb.create_sheet("Прогноз с 1-го числа")
+        _put_table(ws, P1, 1, title="Прогноз эффективности на дату, сделанный до начала месяца (без его факта)",
+                   note="Прошлые месяцы — честный бэктест «Авто»: модели и выбор метода — только по предыдущим месяцам.",
+                   fmt=lambda c: XL_PCT if is_day(c) or c in ("Прогноз на конец", "Факт на конец")
+                   else (XL_PP if c == "Разница, п.п." else None),
+                   style=lambda i, c, v: ((st["none"], None, None) if is_day(c) and c > dim(i) else
+                                          (_err_fill(st, v), None, None) if c == "Разница, п.п." else (None, None, None)))
+
+    # 3. Разница прогноза с 1-го числа и факта на каждую дату, п.п.
+    rows = []
+    for m in bt_keys:
+        plan, fact, dates = btd[m]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rows.append(_day_table(dates, 100 * (paths[pd.Period(m, "M")][0] - np.cumsum(fact)) / np.cumsum(plan)))
+    for m, o in fcm.items():
+        if m not in bt_keys and o["has_fact"].any() and not o["has_fact"].all():
+            rows.append(_day_table(o["date"], o["eff_diff_pp"].where(o["has_fact"])))
+    if rows:
+        D = pd.concat(rows)
+        base = D.loc[[m for m in bt_keys if m in D.index]]
+        D.loc["Средняя |разница|"] = base.abs().mean()
+        D.loc["Месяцев ≤ 1 п.п."] = (base.abs() <= 1).sum() / base.notna().sum().replace(0, np.nan)
+        D.index.name = "Месяц"
+
+        def s3(idx, col, v):
+            if idx == "Месяцев ≤ 1 п.п.":
+                return None, Font(bold=True), XL_PCT
+            if col > dim(idx):
+                return st["none"], None, None
+            return _err_fill(st, v), (Font(bold=True) if idx == "Средняя |разница|" else None), None
+
+        ws = wb.create_sheet("Разница с фактом")
+        _put_table(ws, D, 1, title="Прогноз с 1-го числа минус факт: разница эффективности на каждую дату, п.п.",
+                   note="Зелёный — в пределах 1 п.п., жёлтый — до 2 п.п., красный — больше. Внизу — по дню месяца: "
+                        "средняя |разница| и доля месяцев в пределах 1 п.п.",
+                   fmt=lambda c: XL_PP, style=s3)
+
+    # 4. Прогноз итога месяца по мере поступления факта: k — сколько дней месяца уже известно
+    rows, facts = {}, {}
+    for m in bt_keys:
+        plan, fact, dates = btd[m]
+        rows[m] = pd.Series(paths[pd.Period(m, "M")][:, -1] / plan.sum())
+        facts[m] = fact.sum() / plan.sum()
+    for T, v in dev.items():
+        m = str(T)
+        if m in rows or m not in fcm:
+            continue
+        o = fcm[m]
+        rows[m] = pd.Series(np.asarray(v, dtype=float) / o["plan"].sum())
+        facts[m] = o["fact"].sum() / o["plan"].sum() if o["has_fact"].all() else np.nan
+    if rows:
+        K = pd.DataFrame(rows).T.reindex(columns=range(31))
+        K["Факт на конец"] = [facts[m] for m in K.index]
+        K.index.name = "Месяц"
+
+        def s4(idx, col, v):
+            if col == "Факт на конец":
+                return None, Font(bold=True), None
+            if col >= dim(idx):
+                return st["none"], None, None
+            fact = K.loc[idx, "Факт на конец"]
+            return _err_fill(st, 100 * (v - fact) if np.isfinite(fact) and v is not None else None), None, None
+
+        ws = wb.create_sheet("Итог месяца по мере факта")
+        _put_table(ws, K, 1, title="Прогноз эффективности на конец месяца, когда известно k дней месяца",
+                   note="Столбец — сколько дней месяца уже известно (0 — прогноз до начала месяца). Цвет — разница "
+                        "с фактом на конец месяца: зелёный ≤ 1 п.п., жёлтый ≤ 2 п.п., красный больше.",
+                   fmt=lambda c: XL_PCT, style=s4)
+
+    # сводки
+    for name, parts in tables:
+        ws = wb.create_sheet("".join(" " if ch in ":\\/?*[]" else ch for ch in name)[:31])
+        r = 1
+        for title, t in parts:
+            daily_sheet = "date" in t.columns
+            if daily_sheet:
+                t = t.rename(columns=XL_DAILY)
+            r = _put_table(ws, t, r, title=title, index=not daily_sheet,
+                           fmt=lambda c: "0.00" if any(s in str(c) for s in ("%", "п.п.")) else
+                           (XL_MONEY if str(c) in ("план", "факт", "прогноз без факта месяца", "факт + прогноз остатка")
+                            or "с начала месяца" in str(c) else None))
+
+    for ws in wb.worksheets:
+        ws.column_dimensions["A"].width = 12
+        for j in range(2, ws.max_column + 1):
+            head = ws.cell(3 if ws.title in ("Эффективность", "Прогноз с 1-го числа", "Разница с фактом",
+                                             "Итог месяца по мере факта") else 2, j).value
+            ws.column_dimensions[get_column_letter(j)].width = (7.5 if str(head).isdigit() else 14)
+    sheet = wb["Эффективность"]
+    sheet.column_dimensions["B"].width = 30
+    sheet.freeze_panes = "C4"
+    for name in ("Прогноз с 1-го числа", "Разница с фактом", "Итог месяца по мере факта"):
+        if name in wb.sheetnames:
+            wb[name].freeze_panes = "B4"
+    wb.save(path)
+    print(f"Excel: {path}")
+
+
+# ============================================================================
 # ЗАПУСК
 # ============================================================================
-def run(df: pd.DataFrame, last_fact_date=LAST_FACT_DATE, make_plots=True, prefix="", label=None):
+def run(df: pd.DataFrame, last_fact_date=LAST_FACT_DATE, make_plots=True, prefix="", label=None, excel=None):
     d, last_fact_date, cur, targets = prepare(df, last_fact_date)
     has_debt = "debt" in d
     tag = f" [{label}]" if label else ""
@@ -1294,7 +1584,7 @@ def run(df: pd.DataFrame, last_fact_date=LAST_FACT_DATE, make_plots=True, prefix
         print("Recovery месяца («Авто», честно; «к оплате» известно): средняя |относительная ошибка| — "
               + ", ".join(f"{k} дн.: {rel.get(k, np.nan):.2f}%" for k in (0, 5, 10, 20)))
 
-    fc, fsum, models = production(d, mt, cur, targets, sel, hist, hon)
+    fc, fsum, models, dev = production(d, mt, cur, targets, sel, hist, hon)
     print(f"\nПрогноз{tag}:")
     print(fsum.to_string(index=False))
 
@@ -1327,9 +1617,20 @@ def run(df: pd.DataFrame, last_fact_date=LAST_FACT_DATE, make_plots=True, prefix
         if daily_debt(d):
             curves[NAMES["boost_d"]] = (_curve(h0, "boost_d"), AQUA, "-")
         plot_backtest(curves, f"{OUT_DIR}/{prefix}backtest_error_by_day.png")
+    tables = [("Точность методов", [(f"Честный бэктест, {lab}: разница эффективности прогноза и факта, п.п.",
+                                      honest_table(hon[s]["df"], methods)) for s, lab in SCENARIOS.items()]),
+              ("Авто по месяцам", [("«Авто» по месяцам, план загружен: разница эффективности на конец месяца, п.п. "
+                                    "(+ — прогноз выше факта)",
+                                    by_month.rename_axis("Месяц").rename(
+                                        columns={k: f"известно {k} дн., п.п." for k in REPORT_KNOWN_DAYS}))])]
+    if EXCEL if excel is None else excel:
+        export_excel(f"{OUT_DIR}/{prefix}effectiveness.xlsx", d.loc[d["ym"] <= max(targets), ["date", "plan", "fact"]],
+                     fc, fsum, hon[""]["paths"], {M["ym"]: (M["plan"], M["fact"], M["date"]) for M in months}, dev,
+                     [("Сводка прогноза", [("Прогноз эффективности на конец месяца", fsum.set_index("месяц"))])]
+                     + tables + [("Прогноз по дням", [("Прогноз по дням", fc)])])
     return dict(daily=d, months=mt, backtest=months, hist=hist, selection=sel, honest=hon, winner=winner,
                 plan_cfg=plan_cfg, debt_cfg=debt_cfg, by_month=by_month, forecast=fc, forecast_summary=fsum,
-                models=models, cur=cur, targets=targets)
+                models=models, dev=dev, tables=tables, cur=cur, targets=targets)
 
 
 # ============================================================================
@@ -1367,11 +1668,12 @@ def run_segments(df: pd.DataFrame, segment_col=None, make_plots=True):
             failed.append(str(s))
     print(f"\n{'=' * 110}\nИТОГ: модель на сумме продуктов\n{'=' * 110}")
     total = df[cols].groupby(DATE_COL, as_index=False).sum(min_count=1)
-    tot = run(total, make_plots=make_plots, prefix="total_", label="итог")
+    tot = run(total, make_plots=make_plots, prefix="total_", label="итог", excel=False)
 
     segs = [res[s] for s in res]
     print(f"\n{'=' * 110}\nИТОГ: модель на сумме против суммы прогнозов продуктов (честный бэктест, «Авто»)\n{'=' * 110}")
     choice = {sfx: ("модель на сумме", None) for sfx in SCENARIOS}
+    compare = []
     if failed or not segs:
         print(f"Сумма продуктов не считается: не хватает прогноза по {', '.join(failed) or 'продуктам'}. "
               f"Итог — модель на сумме.")
@@ -1387,6 +1689,8 @@ def run_segments(df: pd.DataFrame, segment_col=None, make_plots=True):
         print(f"\n{lab} (средняя по всем дням |разница|: модель на сумме {s_td:.2f} п.п., сумма продуктов {s_bu:.2f} п.п.):")
         print(t.to_string())
         print(f"→ для итога берём: {choice[sfx][0]}")
+        compare.append((f"Итог, {lab}: модель на сумме против суммы продуктов (честный бэктест «Авто», п.п.) — "
+                        f"берём: {choice[sfx][0]}", t))
 
     # прогноз итога: сумма прогнозов продуктов или модель на сумме — по сценарию месяца
     fcs = [res[s]["forecast"].assign(segment=str(s)) for s in res]
@@ -1424,6 +1728,21 @@ def run_segments(df: pd.DataFrame, segment_col=None, make_plots=True):
     print("\nСводка по продуктам и итогу:")
     print(allsum[["продукт", "месяц", "дней факта", "эфф.: прогноз без факта", "эфф.: факт + прогноз остатка",
                   "80% интервал", "метод"]].to_string(index=False))
+    if EXCEL:  # Excel итога: прогноз — выбранный способ; бэктест и сходимость — тем же способом, что и для плана загружен
+        bu = choice[""][1]
+        paths = bu["paths"] if bu is not None else tot["honest"][""]["paths"]
+        dev = dict(tot["dev"])
+        for T in dev:   # для месяца — тем же способом, что и прогноз итога (зависит от того, загружен ли план)
+            sc = "_pu" if fc_total.loc[fc_total["month"] == str(T), "plan_is_forecast"].any() else ""
+            if choice[sc][1] is not None and all(T in r["dev"] for r in segs):
+                dev[T] = sum(np.asarray(r["dev"][T], dtype=float) for r in segs)
+        export_excel(f"{OUT_DIR}/ИТОГ_effectiveness.xlsx",
+                     tot["daily"].loc[tot["daily"]["ym"] <= max(tot["targets"]), ["date", "plan", "fact"]],
+                     fc_total, fsum_total, paths,
+                     {M["ym"]: (M["plan"], M["fact"], M["date"]) for M in tot["backtest"]}, dev,
+                     [("Сводка по продуктам", [("Прогноз эффективности по продуктам и итогу", allsum.set_index("продукт"))]),
+                      ("Итог — способ", compare or [("Итог — модель на сумме продуктов", pd.DataFrame())])]
+                     + tot["tables"] + [("Прогноз по дням", [("Прогноз итога по дням", fc_total)])])
     return dict(segments=res, total_model=tot, total_forecast=fc_total, total_summary=fsum_total,
                 total_choice={s: c[0] for s, c in choice.items()}, summary=allsum)
 
