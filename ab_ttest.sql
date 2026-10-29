@@ -6,7 +6,9 @@
 -- Используется как virtual dataset в Superset (нужен ENABLE_TEMPLATE_PROCESSING).
 --
 -- Наблюдение = строка таблицы (без свёртки по entity).
--- Контроль = группа 'control', все остальные группы = пилоты.
+-- group_name = <эксперимент>_<группа>: skippay123123_control, skippay123123_pilot.
+-- Контроль — группа, которая заканчивается на '_control', остальные — пилоты.
+-- Каждый пилот сравнивается с контролем своего эксперимента.
 -- Метрики вида SUM(числитель) / SUM(знаменатель).
 --
 -- Общая логика:
@@ -48,9 +50,20 @@ metric_dict AS (
 -- remove_filter=True говорит Superset: фильтр применён здесь,
 -- снаружи к результату его повторно не добавлять.
 -- Если в фильтре ничего не выбрано, условие не добавляется — берём всё.
+--
+-- Здесь же разбираем group_name на две части:
+--   experiment — всё до последнего «_»: 'skippay123123_pilot' → 'skippay123123'.
+--     Внутренний RTRIM срезает справа всё, кроме «_», то есть хвост
+--     после последнего «_»; внешний RTRIM убирает сам «_».
+--   is_control — 1, если группа заканчивается на '_control', иначе 0.
+--     ESCAPE '\' нужен, чтобы «_» в LIKE понимался буквально,
+--     а не как «любой один символ».
 -- ---------------------------------------------------------------------
 filtered AS (
-    SELECT *
+    SELECT
+        *,
+        RTRIM(RTRIM(group_name, REPLACE(group_name, '_', '')), '_')      AS experiment,
+        CASE WHEN group_name LIKE '%\_control' ESCAPE '\' THEN 1 ELSE 0 END AS is_control
     FROM your_table
     WHERE 1 = 1                                   -- заглушка, чтобы дальше все условия начинались с AND
     {% if filter_values('product', remove_filter=True) %}
@@ -74,7 +87,9 @@ step1_rows AS (
     -- покрытие mail: доля дней с отметкой
     SELECT
         'mail_cum'                  AS metric_name,
+        experiment,
         group_name,
+        is_control,
         mail_cum  * 1.0                  AS x,       -- числитель: отметка 1/0
         acc_count * 1.0                  AS y        -- знаменатель
     FROM filtered
@@ -84,7 +99,9 @@ step1_rows AS (
     -- recovery rate: сколько ОД собрано от ОД на старте
     SELECT
         'recovery_rate'                  AS metric_name,
+        experiment,
         group_name,
+        is_control,
         COALESCE(od_fact, 0)  * 1.0      AS x,
         COALESCE(od_start, 0) * 1.0      AS y
     FROM filtered
@@ -94,7 +111,9 @@ step1_rows AS (
     -- покрытие email (гардрейл): доля дней с отметкой email
     SELECT
         'email_cum'                 AS metric_name,
+        experiment,
         group_name,
+        is_control,
         email_cum * 1.0                  AS x,       -- числитель: отметка 1/0
         acc_count * 1.0                  AS y        -- знаменатель
     FROM filtered
@@ -103,16 +122,18 @@ step1_rows AS (
 -- ---------------------------------------------------------------------
 -- 3. κ (КАППА) — «НОРМА» КАЖДОЙ МЕТРИКИ
 -- κ = значение метрики в контроле = ΣX / ΣY по контролю.
--- Это общая линейка для всех групп: с ней сравнивается каждая строка.
+-- Это общая линейка для всех групп эксперимента: с ней сравнивается
+-- каждая строка. У каждого эксперимента свой контроль и свой κ.
 -- NULLIF(…, 0): если знаменатель 0, получаем NULL вместо ошибки деления.
 -- ---------------------------------------------------------------------
 step2_kappa AS (
     SELECT
         metric_name,
+        experiment,
         SUM(x) / NULLIF(SUM(y), 0) AS k
     FROM step1_rows
-    WHERE group_name = 'control'
-    GROUP BY metric_name
+    WHERE is_control = 1
+    GROUP BY metric_name, experiment
 ),
 
 -- ---------------------------------------------------------------------
@@ -128,12 +149,15 @@ step2_kappa AS (
 --   В пилоте среднее L = среднее y · (метрика пилота − метрика контроля).
 -- Значит, «отличаются ли метрики» = «отличаются ли средние L»,
 -- а для средних есть готовая формула шума (t-тест).
--- JOIN по metric_name: каждая метрика линеаризуется своим κ.
+-- JOIN по metric_name и experiment: каждая метрика линеаризуется κ
+-- своего эксперимента. Группы без контроля в эксперименте сюда не попадут.
 -- ---------------------------------------------------------------------
 step3_lin AS (
     SELECT
         e.metric_name,
+        e.experiment,
         e.group_name,
+        e.is_control,
         e.x,
         e.y,
         k.k,
@@ -141,6 +165,7 @@ step3_lin AS (
     FROM step1_rows e
     JOIN step2_kappa k
       ON k.metric_name = e.metric_name
+     AND k.experiment  = e.experiment
 ),
 
 -- ---------------------------------------------------------------------
@@ -150,7 +175,9 @@ step3_lin AS (
 step4_grp AS (
     SELECT
         metric_name,
+        experiment,
         group_name,
+        MAX(is_control)             AS is_control, -- одинаковый во всех строках группы
         COUNT(*)                    AS n,          -- число наблюдений
         AVG(l)                      AS mean_l,     -- среднее L (в контроле ≈ 0)
         VARIANCE(l)                 AS var_l,      -- разброс L: Σ(L − среднее)² / (n − 1)
@@ -158,13 +185,14 @@ step4_grp AS (
         SUM(x) / NULLIF(SUM(y), 0)  AS metric_val, -- значение метрики, как в текущих отчётах
         MAX(k)                      AS k           -- κ одинаковый во всех строках, MAX просто достаёт его
     FROM step3_lin
-    GROUP BY metric_name, group_name
+    GROUP BY metric_name, experiment, group_name
 ),
 
 -- ---------------------------------------------------------------------
 -- 6. КАЖДЫЙ ПИЛОТ В ПАРЕ С КОНТРОЛЕМ + ШУМ РАЗНИЦЫ
 -- Self-join: строки пилотов (t) соединяем со строкой контроля (c)
--- той же метрики. Получаем одну строку на пару «метрика × пилот».
+-- той же метрики и того же эксперимента.
+-- Получаем одну строку на пару «метрика × пилот».
 --
 -- diff_l — разница средних L (сигнал).
 -- se_l   — шум этой разницы, формула t-теста Уэлча:
@@ -176,7 +204,9 @@ step4_grp AS (
 step5_t AS (
     SELECT
         t.metric_name,
-        t.group_name                                AS pilot,
+        t.experiment,
+        t.group_name                              AS pilot,
+        c.group_name                              AS control,
         c.n                                       AS n_c,
         t.n                                       AS n_t,
         c.metric_val                              AS metric_c,
@@ -192,15 +222,16 @@ step5_t AS (
     FROM step4_grp t
     JOIN step4_grp c
       ON c.metric_name = t.metric_name
-     AND c.group_name    = 'control'
-    WHERE t.group_name <> 'control'
+     AND c.experiment  = t.experiment
+     AND c.is_control  = 1
+    WHERE t.is_control = 0
 ),
 
 -- ---------------------------------------------------------------------
 -- 7. t-СТАТИСТИКА И ВСПОМОГАТЕЛЬНЫЕ ВЕЛИЧИНЫ
 -- t_stat   = diff_l / se_l: во сколько раз эффект больше шума.
 -- n_pilots — сколько пилотов сравнивается с контролем по этой метрике
---            (нужно для поправки Бонферрони).
+--            в этом эксперименте (нужно для поправки Бонферрони).
 -- a        — промежуточная величина для формулы p-value
 --            (приближение Abramowitz–Stegun 26.2.17, см. шаг 9).
 -- z_pw     — насколько ожидаемый эффект target_lift заходит за порог
@@ -215,7 +246,7 @@ step6_aux AS (
         COALESCE(d.direction, 1)                                AS direction,
         d.margin,
         COALESCE(d.target_lift, 0.03)                           AS target_lift,
-        COUNT(*) OVER (PARTITION BY s.metric_name)              AS n_pilots,
+        COUNT(*) OVER (PARTITION BY s.metric_name, s.experiment) AS n_pilots,
         diff_l / NULLIF(se_l, 0)                                AS t_stat,
         1.0 / (1.0 + 0.2316419 * ABS(diff_l / NULLIF(se_l, 0))) AS a,
         ABS(COALESCE(d.target_lift, 0.03)) * mean_y_t * k / NULLIF(se_l, 0) - 1.96 AS z_pw
@@ -274,7 +305,9 @@ step8_res AS (
         role,
         direction,
         margin,
+        experiment,
         pilot,
+        control,
         n_pilots,
         n_c,
         n_t,
@@ -360,12 +393,14 @@ step9_flags AS (
 -- product и bucket — какие фильтры выбраны на дашборде (для подписи).
 -- Решение: для primary и secondary — effect_verdict (с поправкой Бонферрони
 -- на число пилотов), для гардрейлов — guardrail_status.
--- Сортировка: по пилоту, внутри — primary, гардрейлы, остальные.
+-- Сортировка: по эксперименту и пилоту, внутри — primary, гардрейлы, остальные.
 -- ---------------------------------------------------------------------
 SELECT
+    experiment,
     metric_name,
     role,
     pilot,
+    control,
     '{{ filter_values("product") | join(", ") or "все" }}'  AS product,
     '{{ filter_values("bucket")  | join(", ") or "все" }}'  AS bucket,
     n_c,
@@ -404,6 +439,7 @@ SELECT
     n_c_needed,
     n_t_needed
 FROM step9_flags
-ORDER BY pilot,
+ORDER BY experiment,
+         pilot,
          CASE role WHEN 'primary' THEN 1 WHEN 'guardrail' THEN 2 ELSE 3 END,
          metric_name;
