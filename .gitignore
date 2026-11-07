@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+outputs/
+*.csv
+*.parquet
+*.arrow
+*.pkl
+!input/*_template.csv
+.env
+.env.*
+*.db
+*.sqlite*
+notebook-check*.txt
+test-results.txt
+october_forecast_project.zip
