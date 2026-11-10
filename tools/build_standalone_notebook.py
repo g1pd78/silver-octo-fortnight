@@ -38,7 +38,9 @@ def build():
 ```
 
 **Простой вход**: pandas DataFrame `df` с `date, fact, plan` за историю и целевой месяц;
-факт целевого месяца может отсутствовать (`NaN`). Даты не подменяются. Дополнительные сегментные колонки сохраняются.
+факт и план целевого месяца могут отсутствовать (`NaN`). При пропусках плана включается резервный денежный прогноз
+по истории до конца месяца; проценты с неизвестным знаменателем не рассчитываются. Даты не подменяются.
+Дополнительные сегментные колонки сохраняются.
 **Детальный вход**: `run(history_df, plan_df, actual_df, config=config)` — история RR, планы всех месяцев,
 отдельный необязательный факт целевого месяца. Ключи: `report_month, report_dt, dt_in, subproduct, dpd_bucket,
 pvr_bucket, terbank, inflow`. История содержит `fact` или `w1,w2,cession,write_off` и `target`;
@@ -52,7 +54,7 @@ pvr_bucket, terbank, inflow`. История содержит `fact` или `w1,
 При настройках по умолчанию нужно минимум 21 месяц полной истории. Границы можно задать явно.
 Для технической проверки переключите `DEMO = True` ниже. Искусственный пример не подтверждает бизнес-точность.
 """)]
-    for name in ["config", "data", "features", "models", "pipeline", "reporting", "demo"]:
+    for name in ["config", "data", "features", "models", "fallback", "pipeline", "reporting", "demo"]:
         cells.append(nbformat.v4.new_markdown_cell(f"## {name}"))
         cells.append(nbformat.v4.new_code_cell(inline((ROOT / "collections_forecast" / f"{name}.py").read_text(encoding="utf-8"))))
     cells += [nbformat.v4.new_markdown_cell("## Настройки и запуск"), nbformat.v4.new_code_cell('''DEMO = False

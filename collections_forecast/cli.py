@@ -82,8 +82,11 @@ def main(argv=None):
             runner.audit()
             if args.report_checks:
                 runner.verify_report(args.report_checks)
-            _, selection = runner.select()
-            control = runner.control()
+            if runner.needs_money_fallback():
+                selection, control = None, pd.DataFrame()
+            else:
+                _, selection = runner.select()
+                control = runner.control()
             runner.forecast()
             score = None
             if args.actual:
@@ -91,7 +94,7 @@ def main(argv=None):
             elif args.compare or args.demo:
                 _, _, score = runner.compare()
         print(json.dumps({"forecast_month": config.forecast_month, "selection": selection,
-                          "control_max_error_pp": float(control.max_error_pp.max()),
+                          "control_max_error_pp": float(control.max_error_pp.max()) if not control.empty else None,
                           "target_metrics": score, "output": str(Path(config.output_dir).resolve()),
                           "artificial_data": args.demo}, ensure_ascii=False, indent=2))
         return 0

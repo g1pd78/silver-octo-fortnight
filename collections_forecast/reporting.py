@@ -21,7 +21,7 @@ def grouped_breakdown(segment, dimensions):
     def strict_sum(s):
         return s.sum(min_count=len(s))
     return segment.groupby([*dimensions, "date"], as_index=False).agg(
-        plan_daily=("plan", "sum"), forecast_daily=("forecast_daily", "sum"),
+        plan_daily=("plan", strict_sum), forecast_daily=("forecast_daily", "sum"),
         fact_daily=("fact", strict_sum), forecast_cumulative=("forecast_cumulative", "sum"),
         fact_cumulative=("fact_cumulative", strict_sum),
         signed_error_cumulative=("signed_error_cumulative", strict_sum),
@@ -58,7 +58,7 @@ def save_report(segment, total, score, config):
     if score["complete"]:
         outcome = "ЦЕЛЬ ДОСТИГНУТА" if score["goal_achieved"] else "ЦЕЛЬ НЕ ДОСТИГНУТА"
     else:
-        outcome = "ОЦЕНКА НЕПОЛНАЯ: пропущенные факты или сегменты вне исходного плана"
+        outcome = "ОЦЕНКА НЕПОЛНАЯ: отсутствует план, пропущены факты или появились сегменты вне исходной сетки"
     failed = total[total.absolute_error_pp.gt(config.tolerance_pp)]
     text = (f"# {config.forecast_month}: {outcome}\n\n"
             f"Допуск: {config.tolerance_pp} п.п. на каждую дату с положительным планом.\n\n"

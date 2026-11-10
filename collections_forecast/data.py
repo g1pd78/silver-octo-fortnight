@@ -130,8 +130,7 @@ def prepare_actual(frame, config, *, before=None, month=None):
     columns = [*actual_keys(config), *amounts]
     if before is not None:
         columns.append("target")
-    elif "target" in frame:
-        columns.append("target")
+    # Evaluation uses the frozen forecast plan, not target from the actual export.
     columns += portfolio if before is not None and not precomputed else [c for c in portfolio if c in frame]
     if config.raw_available_column:
         columns.append(config.raw_available_column)
@@ -238,7 +237,7 @@ def daily_actual(raw, config):
     return raw.groupby(["date", *config.segments], as_index=False, dropna=False).agg(**aggregates)
 
 
-def load_plan(config, month):
+def load_plan(config, month, allow_missing=False):
     """Read target only: target-month fact/debt columns are never selected."""
     table_name = config.plan_table or config.raw_table
     table = identifier(table_name)
@@ -257,7 +256,7 @@ def load_plan(config, month):
             f"SELECT {', '.join(identifier(c) for c in source)} FROM {table} "
             f"WHERE is_forecast=? AND {date_expr} >= ? AND {date_expr} < ?",
             conn, params=[config.plan_is_forecast, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")])
-    return aggregate_plan(prepare_plan(frame, config), config, month)
+    return aggregate_plan(prepare_plan(frame, config), config, month, allow_missing=allow_missing)
 
 
 def prepare_plan(frame, config):
@@ -316,22 +315,48 @@ def split_dated_frame(df, config):
     return history, plan, actual
 
 
-def aggregate_plan(rows, config, month):
+def aggregate_plan(rows, config, month, allow_missing=False):
     dims = list(config.segments)
     frame = rows.loc[rows.report_month.eq(month_start(month))].copy()
-    if frame.empty:
+    if frame.empty and not allow_missing:
         raise ValueError(f"No daily plan for {month}")
     frame["date"] = frame.report_dt
     key = ["date", "dt_in", *dims]
     if "plan_available_at" in frame:
         frame = frame[frame.plan_available_at <= origin(month)]
-        if frame.empty:
+        if frame.empty and not allow_missing:
             raise ValueError(f"No plan version available before {month}")
         if frame.duplicated([*key, "plan_available_at"]).any():
             raise ValueError("Duplicate plan cohort and availability timestamp")
         frame = frame.sort_values("plan_available_at").drop_duplicates(key, keep="last")
     elif frame.duplicated(key).any():
         raise ValueError("Duplicate daily plan cohort; do not sum repeated snapshots")
+    if allow_missing:
+        # An absent future plan is unknown, never an official zero or a reason to
+        # stop the monetary forecast. Expand each cohort before summing segments.
+        frame["plan"] = pd.to_numeric(frame.plan, errors="raise")
+        if np.isinf(frame.plan).any() or frame.plan.lt(0).any():
+            raise ValueError("Plans must be nonnegative and finite when present")
+        parts = []
+        for _, group in frame.groupby(["dt_in", *dims], sort=False):
+            grid = group.set_index("date").plan.reindex(days(month))
+            entry = max(month_start(month), group.dt_in.iloc[0])
+            grid.loc[grid.index < entry] = 0.0
+            if config.plan_mode == "cumulative":
+                source = grid.copy()
+                grid = source.diff()
+                grid.iloc[0] = source.iloc[0]
+            part = pd.DataFrame({"date": grid.index, "plan": grid.to_numpy()})
+            for dim in dims:
+                part[dim] = group[dim].iloc[0]
+            parts.append(part)
+        if not parts:
+            return pd.DataFrame({"date": pd.Series(dtype="datetime64[ns]"),
+                                 **{d: pd.Series(dtype=str) for d in dims}, "plan": pd.Series(dtype=float)})
+        result = pd.concat(parts).groupby(["date", *dims], as_index=False).plan.agg(lambda s: s.sum(skipna=False))
+        if result.plan.lt(0).any():
+            raise ValueError("Daily plans must be nonnegative")
+        return result.sort_values([*dims, "date"]).reset_index(drop=True)
     numeric(frame, ["plan"])
     frame = frame.reset_index(drop=True)
     frame["plan"] = cohort_daily(frame, "plan", config.plan_mode, config)
@@ -442,9 +467,10 @@ class Inputs:
         month = str(month)
         if month not in self._plan_cache:
             if self._plan_rows is None:
-                self._plan_cache[month] = load_plan(self.config, month)
+                self._plan_cache[month] = load_plan(self.config, month, allow_missing=month == self.config.forecast_month)
             else:
-                self._plan_cache[month] = aggregate_plan(self._plan_rows, self.config, month)
+                self._plan_cache[month] = aggregate_plan(self._plan_rows, self.config, month,
+                                                        allow_missing=month == self.config.forecast_month)
         return self._plan_cache[month].copy()
 
 

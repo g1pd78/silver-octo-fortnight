@@ -303,8 +303,8 @@ class ForecastTests(unittest.TestCase):
         with self.copied_database() as c:
             with test_connection(c.db_path) as conn:
                 conn.execute("DELETE FROM rr1plus_data_raw WHERE report_dt='2026-10-01' AND subproduct='ПК'")
-            with self.assertRaisesRegex(ValueError, "every segment"):
-                Inputs(c).plan("2026-10")
+            plan = Inputs(c).plan("2026-10")
+            self.assertEqual(int(plan.plan.isna().sum()), 1)
         with self.copied_database() as c:
             with test_connection(c.db_path) as conn:
                 row = pd.read_sql_query("SELECT * FROM rr1plus_data_raw WHERE report_dt='2026-10-01' LIMIT 1", conn)

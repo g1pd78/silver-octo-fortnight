@@ -17,7 +17,8 @@ def evaluate(forecast, actual, config):
     if forecast.empty or forecast.duplicated(keys).any():
         raise ValueError("Forecast must have a unique, nonempty segment-day grid")
     forecast = forecast.copy()
-    numeric(forecast, ["plan", "forecast_daily"])
+    numeric(forecast, ["forecast_daily"])
+    forecast["plan_missing"] = forecast.plan.isna()
     if forecast.date.dt.to_period("M").nunique() != 1:
         raise ValueError("Evaluate one forecast month at a time")
     expected = days(forecast.date.iloc[0].strftime("%Y-%m"))
@@ -36,12 +37,13 @@ def evaluate(forecast, actual, config):
         f.loc[f.unplanned_actual, c] = 0.0
     f = f.sort_values([*config.segments, "date"]).reset_index(drop=True)
     f["forecast_cumulative"] = f.groupby(list(config.segments)).forecast_daily.cumsum()
-    f["plan_cumulative"] = f.groupby(list(config.segments)).plan.cumsum()
+    f["plan_cumulative"] = f.groupby(list(config.segments)).plan.transform(lambda s: s.cumsum(skipna=False))
     f["fact_cumulative"] = f.groupby(list(config.segments)).fact.transform(lambda s: s.cumsum(skipna=False))
     f["signed_error_daily"] = f.forecast_daily - f.fact
     f["signed_error_cumulative"] = f.forecast_cumulative.fillna(0) - f.fact_cumulative
     total = f.groupby("date", as_index=False).agg(
-        plan_daily=("plan", "sum"), forecast_daily=("forecast_daily", "sum"),
+        plan_daily=("plan", lambda s: s.sum(skipna=False)), forecast_daily=("forecast_daily", "sum"),
+        missing_plan_cells=("plan_missing", "sum"),
         observed_fact_daily=("fact", lambda s: s.sum(min_count=1)),
         missing_actual_cells=("missing_actual", "sum"), unplanned_actual_cells=("unplanned_actual", "sum"))
     total["fact_daily"] = total.observed_fact_daily.where(total.missing_actual_cells.eq(0))
@@ -62,7 +64,8 @@ def metrics(total, config):
     eligible = total.plan_cumulative.gt(0)
     valid = eligible & total.absolute_error_pp.notna()
     full_grid = bool(len(total) and pd.DatetimeIndex(total.date).equals(days(total.date.iloc[0].strftime("%Y-%m"))))
-    complete = bool(full_grid and total.missing_actual_cells.sum() == 0 and total.unplanned_actual_cells.sum() == 0
+    missing_plan = int(total["missing_plan_cells"].sum()) if "missing_plan_cells" in total else 0
+    complete = bool(full_grid and not missing_plan and total.missing_actual_cells.sum() == 0 and total.unplanned_actual_cells.sum() == 0
                     and valid.sum() == eligible.sum() and eligible.any())
     errors = total.loc[valid, "absolute_error_pp"]
     return {
@@ -75,7 +78,7 @@ def metrics(total, config):
         "eligible_days": int(eligible.sum()), "scored_days": int(valid.sum()),
         "missing_actual_cells": int(total.missing_actual_cells.sum()),
         "unplanned_actual_cells": int(total.unplanned_actual_cells.sum()),
-        "complete": complete, "full_month_grid": full_grid,
+        "complete": complete, "full_month_grid": full_grid, "missing_plan_cells": missing_plan,
         "goal_achieved": bool(complete and errors.le(config.tolerance_pp).all()),
     }
 
@@ -132,8 +135,20 @@ class ForecastRunner:
             rows.append({"month": m, "observed_days": part.date.nunique(), "expected_days": len(expected),
                          "fact_sum": float(part.fact.sum()), "raw_plan_sum": float(part.raw_plan.sum())})
         # Build target features now so missing frozen portfolios/plan keys fail before a long backtest.
-        self.builder.build(self.history, c.forecast_month)
+        if not self.needs_money_fallback():
+            self.builder.build(self.history, c.forecast_month)
+        report["missing_future_plan_fallback"] = self.needs_money_fallback()
         return report, pd.DataFrame(rows), daily
+
+    def needs_money_fallback(self):
+        plan = self.inputs.plan(self.config.forecast_month)
+        if plan.empty or plan.plan.isna().any() or plan.plan.sum() <= 0:
+            return True
+        h = raw_asof(self.history, self.config, origin(self.config.forecast_month))
+        recent = h[h.date >= month_start(self.config.forecast_month) - pd.DateOffset(months=self.config.reference_months)]
+        dims = list(self.config.segments)
+        missing = recent[dims].drop_duplicates().merge(plan[dims].drop_duplicates(), on=dims, how="left", indicator=True)
+        return bool(missing._merge.eq("left_only").any())
 
     def _predict_candidates(self, month):
         result = candidates(self.history, month, self.config, self.builder)
@@ -250,6 +265,16 @@ class ForecastRunner:
         """Returns a frozen forecast without reading a single target-month actual."""
         if selection is not None:
             self.selection = dict(selection)
+        if self.needs_money_fallback():
+            from .fallback import money_forecast
+            pred = money_forecast(self.history, self.inputs.plan(self.config.forecast_month), self.config)
+            self.status.append({"model": "money_fallback", "status": "available",
+                                "reason": "Official future plan incomplete; forecast based on historical collections"})
+            pred["forecast_efficiency_pct"] = 100 * pred.forecast_cumulative / pred.plan_cumulative.where(pred.plan_cumulative.gt(0))
+            self.forecast_frame = pred
+            if save:
+                self.save_forecast(pred)
+            return pred
         if self.selection is None:
             raise ValueError("Run select() or supply a frozen selection")
         x, leaves, totals = self._predict_candidates(self.config.forecast_month)
@@ -270,8 +295,8 @@ class ForecastRunner:
             raise FileExistsError(f"A different frozen forecast already exists in {out}; choose a new output_dir")
         forecast_path.write_bytes(payload)
         total = pred.groupby("date", as_index=False).agg(
-            plan_daily=("plan", "sum"), forecast_daily=("forecast_daily", "sum"))
-        total["plan_cumulative"] = total.plan_daily.cumsum()
+            plan_daily=("plan", lambda s: s.sum(skipna=False)), forecast_daily=("forecast_daily", "sum"))
+        total["plan_cumulative"] = total.plan_daily.cumsum(skipna=False)
         total["forecast_cumulative"] = total.forecast_daily.cumsum()
         total["forecast_efficiency_pct"] = 100 * total.forecast_cumulative / total.plan_cumulative.where(total.plan_cumulative.gt(0))
         total["origin"] = origin(c.forecast_month)
@@ -309,7 +334,7 @@ class ForecastRunner:
         json_write(out / "manifest.json", {"config": c.as_dict(), "selection": self.selection,
                    "history_sha256": digest, "plan_sha256": inputs, "versions": versions,
                    "forecast_sha256": hashlib.sha256((out / "forecast.csv").read_bytes()).hexdigest(),
-                   "input_features_sha256": hashlib.sha256(pd.util.hash_pandas_object(
+                   "input_features_sha256": None if self.needs_money_fallback() else hashlib.sha256(pd.util.hash_pandas_object(
                        self.builder.build(self.history, c.forecast_month), index=False).to_numpy().tobytes()).hexdigest(),
                    "source_mode": audit["raw_vintage_mode"],
                    "input_mode": audit["input_mode"],
@@ -354,8 +379,11 @@ def run(df, plan_df=None, actual_df=None, *, config=None, forecast_month=None,
     report_checks = runner.verify_report(report_checks_path) if report_checks_path else None
     if report_checks is not None:
         audit["semantics_verified_against_report"] = True
-    ranking, selection = runner.select()
-    control = runner.control()
+    if runner.needs_money_fallback():
+        ranking, selection, control = pd.DataFrame(), None, pd.DataFrame()
+    else:
+        ranking, selection = runner.select()
+        control = runner.control()
     forecast = runner.forecast(save=save)
 
     segment_comparison = comparison = score = None
