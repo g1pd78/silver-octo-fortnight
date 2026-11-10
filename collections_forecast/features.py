@@ -4,6 +4,36 @@ from .config import month_start, origin, days
 from .data import raw_asof, numeric
 
 
+# Russian production-calendar transfers for the historical forecast window.
+# Kept explicit so old holidays releases cannot silently miss 2026 transfers.
+# Verified against holidays 0.108; user-supplied calendar overrides take precedence.
+RU_DAYS_OFF = {
+    2024: {"02-23", "03-08", "04-29", "04-30", "05-01", "05-09", "05-10", "06-12", "11-04", "12-30", "12-31"},
+    2025: {"05-01", "05-02", "05-08", "05-09", "06-12", "06-13", "11-03", "11-04", "12-31"},
+    2026: {"01-09", "02-23", "03-09", "05-01", "05-11", "06-12", "11-04", "12-31"},
+}
+RU_WORKING_SATURDAYS = {"2024-04-27", "2024-11-02", "2024-12-28", "2025-11-01"}
+
+
+def working_day(calendar, date, country):
+    """Support HolidayBase versions without is_working_day, retaining transfers."""
+    if country.upper() in {"RU", "RUS", "RUSSIA"} and date.year in RU_DAYS_OFF:
+        off = (date.month == 1 and date.day <= 8) or date.strftime("%m-%d") in RU_DAYS_OFF[date.year]
+        return (date.weekday() < 5 and not off) or date.isoformat() in RU_WORKING_SATURDAYS
+    method = getattr(calendar, "is_working_day", None)
+    if callable(method):
+        return bool(method(date))
+    weekend = getattr(calendar, "weekend", {5, 6})
+    transferred = set(getattr(calendar, "weekend_workdays", ()))
+    records = getattr(calendar, "special_public_holidays", {}).get(date.year, ())
+    if records and isinstance(records[0], int):
+        records = (records,)
+    for record in records:
+        if len(record) == 4:
+            transferred.add(date.replace(month=record[2], day=record[3]))
+    return date not in calendar and (date.weekday() not in weekend or date in transferred)
+
+
 class FeatureBuilder:
     def __init__(self, config, inputs):
         self.config, self.inputs = config, inputs
@@ -23,7 +53,11 @@ class FeatureBuilder:
             holiday = pd.Series([int(d.date() in holiday_set) for d in extended], index=extended)
         except ImportError:
             raise ImportError("Install holidays from requirements.txt to construct calendar features")
-        workday = pd.Series([int(holiday_set.is_working_day(d.date())) for d in extended], index=extended)
+        workday = pd.Series([int(working_day(holiday_set, d.date(), self.config.country)) for d in extended], index=extended)
+        if self.config.country.upper() in {"RU", "RUS", "RUSSIA"}:
+            for date in extended:
+                if date.year in RU_DAYS_OFF and date.strftime("%m-%d") in RU_DAYS_OFF[date.year]:
+                    holiday.loc[date] = 1
         overrides = self.inputs.calendar
         if overrides is not None:
             indexed = overrides.set_index("date")
