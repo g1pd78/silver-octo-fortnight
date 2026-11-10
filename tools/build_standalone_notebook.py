@@ -41,6 +41,8 @@ def build():
 факт и план целевого месяца могут отсутствовать (`NaN`). При пропусках плана включается резервный денежный прогноз
 по истории до конца месяца; проценты с неизвестным знаменателем не рассчитываются. Даты не подменяются.
 Дополнительные сегментные колонки сохраняются.
+Исходные имена `report_dt,target` и компоненты `w1,w2,cession,write_off` также поддерживаются.
+При наличии `is_forecast` фактические и прогнозные строки разделяются до расчётов.
 **Детальный вход**: `run(history_df, plan_df, actual_df, config=config)` — история RR, планы всех месяцев,
 отдельный необязательный факт целевого месяца. Ключи: `report_month, report_dt, dt_in, subproduct, dpd_bucket,
 pvr_bucket, terbank, inflow`. История содержит `fact` или `w1,w2,cession,write_off` и `target`;
@@ -53,8 +55,19 @@ pvr_bucket, terbank, inflow`. История содержит `fact` или `w1,
 Первые месяцы используются для обучения, следующие — для выбора модели, последние три — для отдельной проверки.
 При настройках по умолчанию нужно минимум 21 месяц полной истории. Границы можно задать явно.
 Для технической проверки переключите `DEMO = True` ниже. Искусственный пример не подтверждает бизнес-точность.
+
+**Выгрузка для БД:** `forecast_upload.csv` — схема существующей таблицы `forecast`;
+`fact` и `plan` — накопленные денежные суммы **на дату**, `is_forecast=1`, модель `collections.v2`.
+`result["upload"]` содержит тот же набор. Одна строка на дату и сегмент модели, без размножения по `dt_in`.
+Когорты уже суммированы, `dt_in` пустой. Итог на месяц — сумма `fact` по сегментам только на последнюю дату.
+Повторная загрузка заменяет срез `(report_month,forecast_model,forecast_date)`, а не добавляет копии.
+Файл `forecast_daily_totals.csv` / `result["daily_totals"]` — дневной общий прогноз для сверки,
+одна строка на дату. Его не загружают вторым прогнозом той же модели.
+Нельзя присоединять прогноз к сырым строкам RR по дате или восстанавливать `dt_in` через JOIN: это размножит суммы.
+Пустые `ranking/control` означают резервный режим: причины перечислены в `result["plan_status"]`.
+При ошибке входа полный текст сохраняется в `input_error.txt` в каталоге результатов.
 """)]
-    for name in ["config", "data", "features", "models", "fallback", "pipeline", "reporting", "demo"]:
+    for name in ["config", "data", "features", "models", "fallback", "export", "pipeline", "reporting", "demo"]:
         cells.append(nbformat.v4.new_markdown_cell(f"## {name}"))
         cells.append(nbformat.v4.new_code_cell(inline((ROOT / "collections_forecast" / f"{name}.py").read_text(encoding="utf-8"))))
     cells += [nbformat.v4.new_markdown_cell("## Настройки и запуск"), nbformat.v4.new_code_cell('''DEMO = False
@@ -82,6 +95,10 @@ result = run(df, config=config)
 display(result["ranking"].head(10))
 display(result["control"])
 display(result["forecast"].head())
+display(result["upload"])
+print("Режим и полнота плана:", result["plan_status"])
+print("CSV для таблицы forecast:", Path(config.output_dir) / "forecast_upload.csv")
+print("fact/plan — накопленные суммы НА ДАТУ. dt_in пустой: когорты уже агрегированы.")
 '''), nbformat.v4.new_code_cell('''if result["comparison"] is not None:
     display(result["metrics"])
     comparison_figure(result["comparison"], config).show()

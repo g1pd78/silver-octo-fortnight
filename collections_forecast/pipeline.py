@@ -9,6 +9,7 @@ from .config import Config, month_start, origin, days
 from .data import Inputs, load_raw, prepare_actual, raw_asof, daily_actual, numeric, split_dated_frame
 from .features import FeatureBuilder
 from .models import candidates, reconcile, specs, spec_id
+from .export import upload_frame, database_upload_frame
 
 
 def evaluate(forecast, actual, config):
@@ -141,14 +142,31 @@ class ForecastRunner:
         return report, pd.DataFrame(rows), daily
 
     def needs_money_fallback(self):
+        return self.target_plan_status()["mode"] == "money_fallback"
+
+    def target_plan_status(self):
         plan = self.inputs.plan(self.config.forecast_month)
-        if plan.empty or plan.plan.isna().any() or plan.plan.sum() <= 0:
-            return True
+        reasons = []
+        if plan.empty:
+            reasons.append("Нет строк плана целевого месяца из выбранного источника.")
+        missing_cells = int(plan.plan.isna().sum())
+        if missing_cells:
+            reasons.append(f"Неизвестен дневной план в {missing_cells} ячейках дата × сегмент.")
+        if not plan.empty and not missing_cells and plan.plan.sum() <= 0:
+            reasons.append("Суммарный план равен нулю; эффективность относительно плана не определена.")
         h = raw_asof(self.history, self.config, origin(self.config.forecast_month))
         recent = h[h.date >= month_start(self.config.forecast_month) - pd.DateOffset(months=self.config.reference_months)]
         dims = list(self.config.segments)
         missing = recent[dims].drop_duplicates().merge(plan[dims].drop_duplicates(), on=dims, how="left", indicator=True)
-        return bool(missing._merge.eq("left_only").any())
+        absent = missing.loc[missing._merge.eq("left_only"), dims]
+        if len(absent):
+            reasons.append(f"В плане нет {len(absent)} сегментов, присутствовавших в недавней истории.")
+        return {"mode": "money_fallback" if reasons else "selected_model", "reasons": reasons,
+                "missing_plan_cells": missing_cells, "missing_segments": len(absent),
+                "missing_plan_dates": plan.loc[plan.plan.isna(), "date"].drop_duplicates().dt.strftime("%Y-%m-%d").tolist(),
+                "missing_segment_examples": absent.head(10).to_dict("records"),
+                "plan_is_forecast": self.config.plan_is_forecast,
+                "validation": "not_run" if reasons else "model_selection_and_control"}
 
     def _predict_candidates(self, month):
         result = candidates(self.history, month, self.config, self.builder)
@@ -287,6 +305,8 @@ class ForecastRunner:
 
     def save_forecast(self, pred):
         c = self.config
+        daily_upload = upload_frame(pred, c)
+        upload = database_upload_frame(pred, c)
         out = Path(c.output_dir)
         out.mkdir(parents=True, exist_ok=True)
         payload = pred.to_csv(index=False, lineterminator="\n").encode("utf-8-sig")
@@ -294,6 +314,20 @@ class ForecastRunner:
         if forecast_path.exists() and forecast_path.read_bytes() != payload:
             raise FileExistsError(f"A different frozen forecast already exists in {out}; choose a new output_dir")
         forecast_path.write_bytes(payload)
+        upload.to_csv(out / "forecast_upload.csv", index=False, encoding="utf-8-sig", date_format="%Y-%m-%d")
+        daily_upload.to_csv(out / "forecast_daily_totals.csv", index=False, encoding="utf-8-sig", date_format="%Y-%m-%d")
+        json_write(out / "forecast_run_status.json", self.target_plan_status())
+        json_write(out / "forecast_upload_schema.json", {
+            "file": "forecast_upload.csv", "table": "forecast", "grain": "date x model segment; cohorts already aggregated",
+            "key": ["report_month", "report_dt", "dt_in", "subproduct", "dpd_bucket", "pvr_bucket", "terbank", "inflow", "forecast_date", "forecast_model"],
+            "replace_slice": ["report_month", "forecast_model", "forecast_date"],
+            "rows": len(upload), "forecast_month_total": float(daily_upload.forecast_daily.sum()),
+            "amounts": "fact is predicted cumulative money ON report_dt; plan is cumulative ON report_dt. Never sum snapshots across dates.",
+            "cohorts": "dt_in is empty: model forecasts are aggregated across cohorts. Do not attach source dt_in rows.",
+            "missing_plan": "empty CSV cell means NULL, not zero",
+            "load": "upsert by key or replace the entire model/month/origin slice; never append repeated runs",
+            "join": "do not join forecasts to raw cohort rows; aggregate actuals to the same date/segment grain first",
+        })
         total = pred.groupby("date", as_index=False).agg(
             plan_daily=("plan", lambda s: s.sum(skipna=False)), forecast_daily=("forecast_daily", "sum"))
         total["plan_cumulative"] = total.plan_daily.cumsum(skipna=False)
@@ -358,7 +392,7 @@ class ForecastRunner:
         return segment, total, score
 
 
-def run(df, plan_df=None, actual_df=None, *, config=None, forecast_month=None,
+def _run(df, plan_df=None, actual_df=None, *, config=None, forecast_month=None,
         fact_mode=None, plan_mode=None, save=True, report_checks_path=None):
     """Forecast from a date/fact/plan frame or from separate RR frames."""
     config = Config() if config is None else config
@@ -390,7 +424,27 @@ def run(df, plan_df=None, actual_df=None, *, config=None, forecast_month=None,
     if actual_df is not None and not actual_df.empty:
         segment_comparison, comparison, score = runner.compare(actual_df=actual_df, save=save)
     return {
-        "forecast": forecast, "comparison": comparison, "segment_comparison": segment_comparison,
+        "forecast": forecast, "upload": database_upload_frame(forecast, config),
+        "daily_totals": upload_frame(forecast, config), "plan_status": runner.target_plan_status(),
+        "comparison": comparison, "segment_comparison": segment_comparison,
         "metrics": score, "ranking": ranking, "control": control, "selection": selection,
         "audit": audit, "history_months": history_months, "report_checks": report_checks,
     }
+
+
+def run(df, plan_df=None, actual_df=None, *, config=None, forecast_month=None,
+        fact_mode=None, plan_mode=None, save=True, report_checks_path=None):
+    """Run forecasting; retain the complete input error locally for diagnosis."""
+    try:
+        return _run(df, plan_df, actual_df, config=config, forecast_month=forecast_month,
+                    fact_mode=fact_mode, plan_mode=plan_mode, save=save, report_checks_path=report_checks_path)
+    except ValueError as exc:
+        if save:
+            out = Path(config.output_dir if config is not None else Config().output_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            messages, cause = [], exc
+            while cause is not None:
+                messages.append(str(cause))
+                cause = cause.__cause__
+            (out / "input_error.txt").write_text("\n\n".join(messages), encoding="utf-8")
+        raise

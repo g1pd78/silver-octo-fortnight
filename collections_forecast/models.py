@@ -44,7 +44,8 @@ def training_data(history, month, config, builder):
         except ValueError as exc:
             skipped.append({"month": previous, "reason": str(exc)})
     if not frames:
-        raise ValueError(f"No complete training months before {month}; inspect plan archives and fact coverage")
+        reasons = "; ".join(f"{row['month']}: {row['reason']}" for row in skipped)
+        raise ValueError(f"No complete training months before {month}. Reasons by month: {reasons or 'no earlier observations'}")
     return pd.concat(frames, ignore_index=True), pd.concat(totals, ignore_index=True), skipped
 
 

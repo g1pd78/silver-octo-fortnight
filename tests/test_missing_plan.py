@@ -25,6 +25,11 @@ class MissingPlanTests(unittest.TestCase):
         self.assertEqual(forecast.date.max(), pd.Timestamp('2026-10-31'))
         self.assertTrue(np.isfinite(forecast.forecast_daily).all())
         self.assertTrue(forecast.model.str.startswith('fallback_').all())
+        self.assertEqual(result['plan_status']['mode'], 'money_fallback')
+        self.assertEqual(result['plan_status']['validation'], 'not_run')
+        self.assertTrue(result['plan_status']['reasons'])
+        self.assertTrue(result['ranking'].empty)
+        self.assertTrue(result['control'].empty)
         return result
 
     def test_gap_forecasts_to_end_and_does_not_claim_success(self):
@@ -40,6 +45,11 @@ class MissingPlanTests(unittest.TestCase):
             result = self.check_result(self.df[self.df.date.lt('2026-10-01')], replace(self.c, output_dir=temp), save=True)
             self.assertTrue(result['forecast'].plan.isna().all())
             self.assertIsNone(result['comparison'])
+            upload = pd.read_csv(temp + '/forecast_upload.csv')
+            self.assertEqual(len(upload), 31)
+            self.assertIn('fact', upload)
+            self.assertNotIn('forecast_daily', upload)
+            self.assertAlmostEqual(upload.fact.iloc[-1], result['forecast'].forecast_daily.sum())
 
     def test_all_nan_future_plan_and_modified_future_fact(self):
         self.df.loc[self.df.date.ge('2026-10-01'), 'plan'] = np.nan

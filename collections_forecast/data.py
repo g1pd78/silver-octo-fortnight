@@ -17,9 +17,13 @@ def identifier(name):
 
 def numeric(frame, columns):
     for col in columns:
-        frame[col] = pd.to_numeric(frame[col], errors="raise")
-        if not np.isfinite(frame[col]).all():
-            raise ValueError(f"Missing or non-finite numeric value: {col}")
+        parsed = pd.to_numeric(frame[col], errors="coerce")
+        bad = parsed.isna() | ~np.isfinite(parsed)
+        if bad.any():
+            examples = frame.loc[bad, col].head(5).to_dict()
+            raise ValueError(f"Missing or non-finite numeric value: {col}; {int(bad.sum())}/{len(frame)} rows; "
+                             f"examples (index: value)={examples}. Check NULLs and numeric formatting; values were not replaced with zero.")
+        frame[col] = parsed
     return frame
 
 
@@ -180,7 +184,10 @@ def prepare_actual(frame, config, *, before=None, month=None):
     key = ["report_month", "date", "dt_in", *dims]
     version_key = key + (["available_at"] if config.raw_available_column else [])
     if frame.duplicated(version_key).any():
-        raise ValueError("Duplicate raw grain (including dt_in); resolve duplicates before aggregation")
+        duplicates = frame.loc[frame.duplicated(version_key, keep=False), version_key]
+        raise ValueError(f"Duplicate raw grain (including dt_in): {len(duplicates)} rows on keys {version_key}; "
+                         f"examples={duplicates.head(3).to_dict('records')}. "
+                         "Check joins and source versions; repeated snapshot amounts must not be summed.")
     return frame
 
 
@@ -201,8 +208,11 @@ def cohort_daily(frame, value, mode, config):
         end = month_ends.loc[group.report_month.iloc[0]]
         expected = pd.date_range(start, end, freq="D")
         if not pd.DatetimeIndex(active.date).equals(expected):
+            missing = expected.difference(pd.DatetimeIndex(active.date))
             raise ValueError(f"Cumulative {value}: missing cohort snapshots from {start.date()} to {end.date()}; "
-                             "supply a complete stable cohort series or independently reconciled daily amounts")
+                             f"key={group[keys].iloc[0].to_dict()}; missing dates={missing.strftime('%Y-%m-%d').tolist()[:10]}. "
+                             "If DPD/PVR segments change between snapshots, aggregate to a stable grain before differencing; "
+                             "otherwise supply a complete stable cohort series or independently reconciled daily amounts")
         result.loc[group.index[before_entry]] = 0.0
         if not active.empty:
             change = active[value].diff()
@@ -290,10 +300,17 @@ def prepare_plan(frame, config):
 
 def split_dated_frame(df, config):
     """Adapt date/fact/plan rows to separate history, plan and evaluation inputs."""
-    missing = {"date", "fact", "plan"} - set(df)
+    frame = df.copy()
+    if "date" not in frame and "report_dt" in frame:
+        frame["date"] = frame.report_dt
+    if "plan" not in frame and "target" in frame:
+        frame["plan"] = frame.target
+    if "fact" not in frame and {"w1", "w2", "cession", "write_off"} <= set(frame):
+        components = frame[["w1", "w2", "cession", "write_off"]].apply(pd.to_numeric, errors="raise")
+        frame["fact"] = components.w1 - components.w2 - components.cession - components.write_off
+    missing = {"date", "fact", "plan"} - set(frame)
     if missing:
         raise ValueError(f"run(df) needs columns date, fact, plan. Missing: {sorted(missing)}")
-    frame = df.copy()
     frame["report_dt"] = parse_dates(frame.date, config.raw_date_encoding).dt.normalize()
     if frame.report_dt.isna().any():
         raise ValueError("Missing date in run(df) input")
@@ -306,12 +323,22 @@ def split_dated_frame(df, config):
     frame["target"] = frame.plan
     start = month_start(config.forecast_month)
     end = start + pd.offsets.MonthBegin()
-    history = frame.loc[frame.report_dt.lt(start) & frame.fact.notna()]
+    actual_rows = pd.Series(True, index=frame.index)
+    plan_rows = actual_rows.copy()
+    if "is_forecast" in frame:
+        flags = pd.to_numeric(frame.is_forecast, errors="raise")
+        if not flags.isin([0, 1]).all():
+            raise ValueError("is_forecast must be 0 or 1")
+        actual_rows = flags.eq(0)
+        # Historical training plans come from actual snapshots. Target plans use
+        # the explicitly configured source; never sum both source kinds together.
+        plan_rows = (frame.report_dt.lt(start) & flags.eq(0)) | (frame.report_dt.ge(start) & flags.eq(config.plan_is_forecast))
+    history = frame.loc[frame.report_dt.lt(start) & frame.fact.notna() & actual_rows]
     plan_cols = [*actual_keys(config), "target"]
     if config.plan_available_column:
         plan_cols.append(config.plan_available_column)
-    plan = frame.loc[frame.report_dt.lt(end) & frame.target.notna(), plan_cols]
-    actual = frame.loc[frame.report_dt.ge(start) & frame.report_dt.lt(end) & frame.fact.notna()]
+    plan = frame.loc[frame.report_dt.lt(end) & frame.target.notna() & plan_rows, plan_cols]
+    actual = frame.loc[frame.report_dt.ge(start) & frame.report_dt.lt(end) & frame.fact.notna() & actual_rows]
     return history, plan, actual
 
 

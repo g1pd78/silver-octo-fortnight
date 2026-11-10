@@ -29,7 +29,7 @@ def display(value):
     pass
 import plotly.io as pio
 pio.show = lambda *args, **kwargs: None
-""" + "\n\n".join(sources) + "\nassert len(result['comparison']) == 31\nassert result['metrics']['complete']\nprint('Standalone notebook execution passed')\n", encoding="utf-8")
+""" + "\n\n".join(sources) + "\nassert len(result['comparison']) == 31\nassert result['metrics']['complete']\nassert len(result['daily_totals']) == 31\nassert not result['daily_totals'].date.duplicated().any()\nassert len(result['upload']) == len(result['forecast'])\nassert (Path(config.output_dir) / 'forecast_upload.csv').exists()\nprint('Standalone notebook execution passed')\n", encoding="utf-8")
         subprocess.run([sys.executable, "-I", str(script)], cwd=directory, check=True)
 
 
