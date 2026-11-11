@@ -41,7 +41,11 @@ assert len(legacy_csv) == 31
 assert not legacy_csv.report_dt.duplicated().any()
 assert pd.to_datetime(legacy_csv.dt_in).eq(month_start(config.forecast_month)).all()
 assert pd.to_datetime(legacy_csv.forecast_date).eq(month_start(config.forecast_month)).all()
-print('Standalone notebook execution and old-uploader CSV passed')
+filtered_csv = read_filtered_dashboard_csv(f'forecast_collections.v2.allocated_{month_start(config.forecast_month):%Y%m%d}.csv')
+assert filtered_csv.subproduct.nunique() == 2
+assert filtered_csv.forecast_model.eq('collections.v2.allocated').all()
+np.testing.assert_allclose(filtered_csv.groupby('report_dt').fact.sum(), result['dashboard_upload'].fact)
+print('Standalone notebook execution, aggregate and filtered CSVs passed')
 """, encoding="utf-8")
         subprocess.run([sys.executable, "-I", str(script)], cwd=directory, check=True)
 

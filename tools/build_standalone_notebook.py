@@ -104,6 +104,8 @@ if DEMO:
     raw = demo_rows()
     raw["fact"] = raw.w1 - raw.w2 - raw.cession - raw.write_off
     df = raw.rename(columns={"report_dt": "date", "target": "plan"})
+    df_layout = raw.copy()
+    df_layout["plan"] = df_layout.groupby(["report_month", "dt_in", *config.segments]).target.cumsum()
 else:
     config = Config(
         forecast_month="2026-11",  # измените целевой месяц
@@ -127,6 +129,36 @@ result["dashboard_upload"].to_csv(dashboard_csv, index=False, encoding="utf-8-si
 print("Файл для СТАРОГО загрузчика:", dashboard_csv.resolve())
 print("Одна строка на дату. fact/plan — накопленные суммы. dt_in и forecast_date — первое число месяца.")
 print("Поместите этот CSV рядом с upload_model_effect.py. Его чтение долга и загрузку в БД оставьте прежними.")
+'''), nbformat.v4.new_markdown_cell('''## CSV с фильтрами продукта, DPD, PVR, ТБ и входов
+
+Подготовьте `df_layout`: полный **известный на момент прогноза** план целевого месяца по строкам
+`report_dt,dt_in,subproduct,dpd_bucket,terbank,pvr_bucket,inflow,plan,dolg`.
+Поддерживаются также имена `date,target,w1`. `plan/target` в этой таблице **накопленный на дату**.
+Если все эти поля есть в исходном `df` с накопленным планом, можно задать `df_layout = df.copy()`.
+Общий прогноз распределяется по долям плана; при неизвестном/нулевом общем плане — по долям долга.
+Это распределение, не отдельная модель качества каждого сегмента. Сумма прогноза по строкам
+сохраняется на каждой дате. Долг каждой когорты берётся из `df_layout`, а не из общего итога.
+
+**Этот файл загружается с сохранением всех полей**: не использовать блок старого загрузчика,
+который стирает сегменты и заменяет `dt_in`/`dolg`. Вместо него после чтения файла:
+```python
+from dashboard_upload_adapter import read_filtered_dashboard_csv
+df = read_filtered_dashboard_csv(CSV)
+db.upload_forecast(df)
+```
+Существующий шаг обновления витрины сохраните. В дашборде выбирайте модель `collections.v2.allocated`.
+Не объединяйте её строки с общим прогнозом `collections.v2` в одну сумму.
+'''), nbformat.v4.new_code_cell('''if "df_layout" in globals():
+    filtered = filtered_dashboard_upload(result["dashboard_upload"], df_layout, config)
+    release = pd.Timestamp(filtered.forecast_date.iloc[0]).strftime("%Y%m%d")
+    filtered_csv = Path(f"forecast_collections.v2.allocated_{release}.csv")
+    filtered.to_csv(filtered_csv, index=False, encoding="utf-8-sig", date_format="%Y-%m-%d")
+    result["filtered_upload"] = filtered
+    print("CSV с фильтрами:", filtered_csv.resolve())
+    print("Строк:", len(filtered), "| Уникальных дат:", filtered.report_dt.nunique())
+    display(filtered.head())
+else:
+    print("Для CSV с фильтрами подготовьте df_layout по описанию выше. Общий прогноз уже сохранён.")
 '''), nbformat.v4.new_code_cell('''if result["comparison"] is not None:
     display(result["metrics"])
     comparison_figure(result["comparison"], config).show()
@@ -145,7 +177,10 @@ else:
     # A companion file for the user's separate DB loader: no installed package
     # required, and the implementation is extracted from the same tested source.
     definitions = []
-    for module, function in [("config", "days"), ("export", "aggregate_database_upload"), ("export", "legacy_dashboard_upload")]:
+    for module, function in [("config", "days"), ("config", "month_start"), ("config", "origin"),
+                             ("data", "parse_dates"), ("export", "aggregate_database_upload"),
+                             ("export", "legacy_dashboard_upload"), ("export", "filtered_dashboard_upload"),
+                             ("export", "read_filtered_dashboard_csv")]:
         source = (ROOT / "collections_forecast" / f"{module}.py").read_text(encoding="utf-8")
         node = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == function)
         definitions.append(ast.get_source_segment(source, node))
