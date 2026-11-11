@@ -29,7 +29,20 @@ def display(value):
     pass
 import plotly.io as pio
 pio.show = lambda *args, **kwargs: None
-""" + "\n\n".join(sources) + "\nassert len(result['comparison']) == 31\nassert result['metrics']['complete']\nassert len(result['daily_totals']) == 31\nassert not result['daily_totals'].date.duplicated().any()\nassert len(result['upload']) == len(result['forecast'])\nassert (Path(config.output_dir) / 'forecast_upload.csv').exists()\nprint('Standalone notebook execution passed')\n", encoding="utf-8")
+""" + "\n\n".join(sources) + """
+assert len(result['comparison']) == 31
+assert result['metrics']['complete']
+assert len(result['daily_totals']) == 31
+assert not result['daily_totals'].date.duplicated().any()
+assert len(result['upload']) == len(result['forecast'])
+assert (Path(config.output_dir) / 'forecast_upload.csv').exists()
+legacy_csv = pd.read_csv(f'forecast_{config.forecast_month}.csv')
+assert len(legacy_csv) == 31
+assert not legacy_csv.report_dt.duplicated().any()
+assert pd.to_datetime(legacy_csv.dt_in).eq(month_start(config.forecast_month)).all()
+assert pd.to_datetime(legacy_csv.forecast_date).eq(month_start(config.forecast_month)).all()
+print('Standalone notebook execution and old-uploader CSV passed')
+""", encoding="utf-8")
         subprocess.run([sys.executable, "-I", str(script)], cwd=directory, check=True)
 
 

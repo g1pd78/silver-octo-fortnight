@@ -156,3 +156,16 @@ def aggregate_database_upload(frame, *, debt_by_day=None, report_month=None, for
     if not str(total.forecast_model.iloc[0]).strip():
         raise ValueError("forecast_model cannot be empty")
     return total[columns]
+
+
+def legacy_dashboard_upload(frame, *, debt_by_day=None, report_month=None, forecast_model=None):
+    """Exact aggregate identifiers used by the user's existing uploader.
+
+    forecast_date here is the dashboard slice label (month start). The actual
+    information cutoff remains in the prediction origin and run manifest.
+    """
+    total = aggregate_database_upload(frame, debt_by_day=debt_by_day,
+                                      report_month=report_month, forecast_model=forecast_model)
+    total["dt_in"] = total.report_month
+    total["forecast_date"] = total.report_month
+    return total

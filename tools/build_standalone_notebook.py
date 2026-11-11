@@ -28,6 +28,17 @@ def build():
 `100 * abs(прогноз_накопленный - факт_накопленный) / план_накопленный` в процентных пунктах.
 Цель — не больше 1 п.п. на каждой дате; достижение цели на рабочих данных пока не подтверждено.
 
+**Для вашего RR-запроса** `sum(w1-w2-cession-write_off)` и `sum(target)` — накопленные снимки на дату.
+Поэтому рабочий конфиг ниже использует **`fact_mode="cumulative", plan_mode="cumulative"`**.
+`daily` для таких снимков повторно накапливает деньги и сильно завышает график. Если вы передаёте
+независимо рассчитанные дневные приращения, только тогда выбирайте `daily`.
+
+**Рабочий путь загрузки:** оставьте старый `upload_model_effect.py`. После расчёта рядом с ноутбуком
+создаётся `forecast_YYYY-MM.csv` — одна строка на дату, в формате его входа. Поместите этот файл рядом
+с загрузчиком. В нём `dt_in` и `forecast_date` — первое число месяца, как в вашем рабочем коде;
+истинный момент доступности данных остаётся в `origin` аналитического прогноза и `manifest.json`.
+Для этого пути отдельный адаптер не требуется.
+
 Перед запуском выберите смысл входных сумм: `daily` — за день, `cumulative` — с начала месяца/входа когорты.
 Режимы факта и плана независимы. Накопленные снимки должны быть полными, с устойчивыми ключами когорт.
 Пропуски не заменяются нулями, отрицательные корректировки сохраняются.
@@ -97,9 +108,9 @@ else:
     config = Config(
         forecast_month="2026-11",  # измените целевой месяц
         forecast_grain="total",    # общий KPI; полный снимок портфеля на каждую дату
-        fact_mode="daily",         # либо cumulative после сверки с отчётом
-        plan_mode="daily",         # выбирается отдельно от факта
-        output_dir="outputs/forecast_total",
+        fact_mode="cumulative",    # RR: w1 - w2 - cession - write_off — сбор НА ДАТУ
+        plan_mode="cumulative",    # RR: target — план НА ДАТУ
+        output_dir="outputs/forecast_rr_fixed",
     )
     # df = ваш_коннектор(...)  # date, fact, plan; включая известный будущий план
     if "df" not in globals():
@@ -109,11 +120,13 @@ result = run(df, config=config)
 display(result["ranking"].head(10))
 display(result["control"])
 display(result["forecast"].head())
-display(result["upload"])
+display(result["dashboard_upload"])
 print("Режим и полнота плана:", result["plan_status"])
-print("CSV для таблицы forecast:", Path(config.output_dir) / "forecast_upload.csv")
-print("CSV для агрегатного загрузчика дашборда:", Path(config.output_dir) / "forecast_upload_total.csv")
-print("fact/plan — накопленные суммы НА ДАТУ. dt_in пустой: когорты уже агрегированы.")
+dashboard_csv = Path(f"forecast_{config.forecast_month}.csv")
+result["dashboard_upload"].to_csv(dashboard_csv, index=False, encoding="utf-8-sig", date_format="%Y-%m-%d")
+print("Файл для СТАРОГО загрузчика:", dashboard_csv.resolve())
+print("Одна строка на дату. fact/plan — накопленные суммы. dt_in и forecast_date — первое число месяца.")
+print("Поместите этот CSV рядом с upload_model_effect.py. Его чтение долга и загрузку в БД оставьте прежними.")
 '''), nbformat.v4.new_code_cell('''if result["comparison"] is not None:
     display(result["metrics"])
     comparison_figure(result["comparison"], config).show()
@@ -132,7 +145,7 @@ else:
     # A companion file for the user's separate DB loader: no installed package
     # required, and the implementation is extracted from the same tested source.
     definitions = []
-    for module, function in [("config", "days"), ("export", "aggregate_database_upload")]:
+    for module, function in [("config", "days"), ("export", "aggregate_database_upload"), ("export", "legacy_dashboard_upload")]:
         source = (ROOT / "collections_forecast" / f"{module}.py").read_text(encoding="utf-8")
         node = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == function)
         definitions.append(ast.get_source_segment(source, node))
