@@ -22,6 +22,7 @@ class Config:
     control_end: str | None = None
     fact_mode: str | None = None  # daily or cumulative, explicitly chosen by the caller
     plan_mode: str | None = None
+    forecast_grain: str = "segments"  # total: forecast the complete portfolio snapshots by date
     min_train_months: int = 12
     raw_table: str = "rr1plus_data_raw"
     raw_available_column: str | None = None
@@ -54,6 +55,11 @@ class Config:
         return replace(self, **values)
 
     def validate(self):
+        if self.forecast_grain not in {"segments", "total"}:
+            raise ValueError("forecast_grain must be segments or total")
+        if self.forecast_grain == "total" and any([self.portfolio_path, self.inflow_path, self.operations_path, self.reference_path]):
+            raise ValueError("Total forecast currently uses raw portfolio fields and calendar_path; "
+                             "remove segment-level portfolio/inflow/operations/reference paths or use segments mode")
         if self.fact_mode not in {"daily", "cumulative"} or self.plan_mode not in {"daily", "cumulative"}:
             raise ValueError("Explicitly set fact_mode and plan_mode to 'daily' or 'cumulative' after checking the source report")
         if self.plan_is_forecast not in (0, 1):

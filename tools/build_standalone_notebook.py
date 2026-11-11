@@ -32,6 +32,12 @@ def build():
 Режимы факта и плана независимы. Накопленные снимки должны быть полными, с устойчивыми ключами когорт.
 Пропуски не заменяются нулями, отрицательные корректировки сохраняются.
 
+Для общего KPI в этом ноутбуке выбран `forecast_grain="total"`: на каждой дате сначала суммируется
+полный снимок портфеля, затем накопленные суммы переводятся в дневные. Изменение DPD/PVR/продукта
+не создаёт искусственные отсутствующие когорты. Вход должен содержать полный портфель на каждую дату;
+заполненные суммы в отдельных строках сами по себе не доказывают полноту выгрузки.
+При `forecast_grain="segments"` сохраняется строгая проверка устойчивых сегментных/когортных рядов.
+
 Установите зависимости в используемое ядро, если нужно:
 ```python
 %pip install "numpy>=1.26,<3" "pandas>=2.2,<4" "plotly>=5.20,<8" "matplotlib>=3.8,<4" "catboost>=1.2,<2" "statsmodels>=0.14,<0.16" "holidays>=0.60,<1"
@@ -80,6 +86,7 @@ pvr_bucket, terbank, inflow`. История содержит `fact` или `w1,
 
 if DEMO:
     config = replace(make_demo("outputs/notebook_demo_inputs"),
+                     forecast_grain="total",
                      development_start="2026-04", development_end="2026-04",
                      control_start="2026-09", control_end="2026-09",
                      catboost_iterations=20)
@@ -89,9 +96,10 @@ if DEMO:
 else:
     config = Config(
         forecast_month="2026-11",  # измените целевой месяц
+        forecast_grain="total",    # общий KPI; полный снимок портфеля на каждую дату
         fact_mode="daily",         # либо cumulative после сверки с отчётом
         plan_mode="daily",         # выбирается отдельно от факта
-        output_dir="outputs/forecast",
+        output_dir="outputs/forecast_total",
     )
     # df = ваш_коннектор(...)  # date, fact, plan; включая известный будущий план
     if "df" not in globals():

@@ -124,6 +124,7 @@ class ForecastRunner:
             "plan_vintage_mode": "timestamped" if c.plan_available_column else "snapshot_no_plan_vintages",
             "calendar_mode": "approved_overrides" if self.inputs.calendar is not None else "holidays_library_with_workday_transfers",
             "fact_semantics": c.fact_mode,
+            "forecast_grain": c.forecast_grain,
             "plan_semantics": c.plan_mode, "semantics_verified_against_report": self.report_verified,
             "available_target_plan_rows": len(self.inputs.plan(c.forecast_month)),
             "external_reference": bool(c.reference_path),
@@ -162,6 +163,7 @@ class ForecastRunner:
         if len(absent):
             reasons.append(f"В плане нет {len(absent)} сегментов, присутствовавших в недавней истории.")
         return {"mode": "money_fallback" if reasons else "selected_model", "reasons": reasons,
+                "forecast_grain": self.config.forecast_grain,
                 "missing_plan_cells": missing_cells, "missing_segments": len(absent),
                 "missing_plan_dates": plan.loc[plan.plan.isna(), "date"].drop_duplicates().dt.strftime("%Y-%m-%d").tolist(),
                 "missing_segment_examples": absent.head(10).to_dict("records"),

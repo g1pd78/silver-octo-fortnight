@@ -221,12 +221,49 @@ def cohort_daily(frame, value, mode, config):
     return result
 
 
+def portfolio_totals(frame, config, *, plan_only=False):
+    """Sum a complete portfolio snapshot before differencing or expanding dates.
+
+    Source duplicates and availability must be resolved BEFORE calling this.
+    Segment absence is not imputed: totals are sums of the supplied snapshot.
+    The caller explicitly selects total grain and must supply complete snapshots.
+    """
+    if frame.empty:
+        return frame.copy()
+    f = frame.copy()
+    sums = ["plan"] if plan_only else [c for c in
+            ["fact", "target", "_source_fact", "_source_target", "w1", "w2", "cession", "write_off", "acc_count"] if c in f]
+    aggs = {c: (c, lambda s: s.sum(skipna=False)) for c in sums}
+    if not plan_only:
+        for name in ["available_at", config.raw_available_column]:
+            if name and name in f:
+                aggs[name] = (name, "max")
+        for name in ["avg_dpd", "avg_pvr"]:
+            if name in f and "w1" in f:
+                f[f"_{name}_weighted"] = f[name] * f.w1
+                f[f"_{name}_weight"] = f.w1.where(f[name].notna(), 0)
+                aggs[f"_{name}_weighted"] = (f"_{name}_weighted", "sum")
+                aggs[f"_{name}_weight"] = (f"_{name}_weight", "sum")
+    total = f.groupby(["report_month", "date"], as_index=False).agg(**aggs)
+    for name in ["avg_dpd", "avg_pvr"]:
+        if f"_{name}_weighted" in total:
+            total[name] = total.pop(f"_{name}_weighted") / total.pop(f"_{name}_weight").replace(0, np.nan)
+    total["report_dt"] = total.date
+    total["dt_in"] = total.report_month
+    total["month"] = total.date.dt.strftime("%Y-%m")
+    for dim in config.segments:
+        total[dim] = "0" if dim == "inflow" else "ВСЕ"
+    return total
+
+
 def raw_asof(raw, config, cutoff):
     f = raw[raw.date <= cutoff].copy()
     if config.raw_available_column:
         f = f[f.available_at <= cutoff]
         key = ["report_month", "date", "dt_in", *config.segments]
         f = f.sort_values("available_at").drop_duplicates(key, keep="last")
+    if config.forecast_grain == "total":
+        f = portfolio_totals(f, config)
     f = f.reset_index(drop=True)
     if "_source_fact" not in f:
         f["_source_fact"] = f.fact
@@ -333,11 +370,21 @@ def split_dated_frame(df, config):
         # Historical training plans come from actual snapshots. Target plans use
         # the explicitly configured source; never sum both source kinds together.
         plan_rows = (frame.report_dt.lt(start) & flags.eq(0)) | (frame.report_dt.ge(start) & flags.eq(config.plan_is_forecast))
+    if config.forecast_grain == "total":
+        observed = frame.loc[actual_rows & frame.report_dt.lt(end)]
+        counts = observed.groupby("report_dt").fact.agg(["count", "size"])
+        partial = counts.index[(counts["count"] > 0) & (counts["count"] < counts["size"])]
+        if len(partial):
+            raise ValueError("Total forecast: partially missing fact within a supplied daily snapshot on "
+                             + ", ".join(partial.strftime("%Y-%m-%d")[:10])
+                             + "; reconcile these rows before summing the portfolio. Unknown facts are not zero.")
     history = frame.loc[frame.report_dt.lt(start) & frame.fact.notna() & actual_rows]
     plan_cols = [*actual_keys(config), "target"]
     if config.plan_available_column:
         plan_cols.append(config.plan_available_column)
-    plan = frame.loc[frame.report_dt.lt(end) & frame.target.notna() & plan_rows, plan_cols]
+    # Keep explicit NULL plan cells: discarding them can turn a partial sum into
+    # an apparently complete total when other segments have a known plan.
+    plan = frame.loc[frame.report_dt.lt(end) & plan_rows, plan_cols]
     actual = frame.loc[frame.report_dt.ge(start) & frame.report_dt.lt(end) & frame.fact.notna() & actual_rows]
     return history, plan, actual
 
@@ -358,6 +405,13 @@ def aggregate_plan(rows, config, month, allow_missing=False):
         frame = frame.sort_values("plan_available_at").drop_duplicates(key, keep="last")
     elif frame.duplicated(key).any():
         raise ValueError("Duplicate daily plan cohort; do not sum repeated snapshots")
+    if config.forecast_grain == "total":
+        # A moving DPD/PVR cohort does not require a synthetic future row in its
+        # old bucket. Use the supplied complete daily portfolio plan snapshots.
+        frame["plan"] = pd.to_numeric(frame.plan, errors="raise")
+        if np.isinf(frame.plan).any() or frame.plan.lt(0).any():
+            raise ValueError("Plans must be nonnegative and finite when present")
+        frame = portfolio_totals(frame, config, plan_only=True)
     if allow_missing:
         # An absent future plan is unknown, never an official zero or a reason to
         # stop the monetary forecast. Expand each cohort before summing segments.
