@@ -63,6 +63,12 @@ pvr_bucket, terbank, inflow`. История содержит `fact` или `w1,
 Повторная загрузка заменяет срез `(report_month,forecast_model,forecast_date)`, а не добавляет копии.
 Файл `forecast_daily_totals.csv` / `result["daily_totals"]` — дневной общий прогноз для сверки,
 одна строка на дату. Его не загружают вторым прогнозом той же модели.
+Для агрегатного загрузчика дашборда используйте `forecast_upload_total.csv` / `result["upload_total"]`:
+это схема таблицы `forecast` с накопленными суммами, ровно одна строка на дату.
+Выбирайте один файл: сегментный или общий, не загружайте оба как один прогноз.
+Если общий долг берётся из дашборда, используйте `aggregate_database_upload(upload, debt_by_day=dolg_df)`;
+эта функция агрегирует сегменты до присоединения общего долга. Долг целевого месяца здесь служит только
+для визуального сравнения RR и не поступает в обучение или оценку до начала месяца.
 Нельзя присоединять прогноз к сырым строкам RR по дате или восстанавливать `dt_in` через JOIN: это размножит суммы.
 Пустые `ranking/control` означают резервный режим: причины перечислены в `result["plan_status"]`.
 При ошибке входа полный текст сохраняется в `input_error.txt` в каталоге результатов.
@@ -98,6 +104,7 @@ display(result["forecast"].head())
 display(result["upload"])
 print("Режим и полнота плана:", result["plan_status"])
 print("CSV для таблицы forecast:", Path(config.output_dir) / "forecast_upload.csv")
+print("CSV для агрегатного загрузчика дашборда:", Path(config.output_dir) / "forecast_upload_total.csv")
 print("fact/plan — накопленные суммы НА ДАТУ. dt_in пустой: когорты уже агрегированы.")
 '''), nbformat.v4.new_code_cell('''if result["comparison"] is not None:
     display(result["metrics"])
@@ -114,6 +121,17 @@ else:
     target = ROOT / "october_forecast_standalone.ipynb"
     nbformat.write(notebook, target)
     print(target)
+    # A companion file for the user's separate DB loader: no installed package
+    # required, and the implementation is extracted from the same tested source.
+    definitions = []
+    for module, function in [("config", "days"), ("export", "aggregate_database_upload")]:
+        source = (ROOT / "collections_forecast" / f"{module}.py").read_text(encoding="utf-8")
+        node = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == function)
+        definitions.append(ast.get_source_segment(source, node))
+    adapter = ROOT / "dashboard_upload_adapter.py"
+    adapter.write_text('"""Generated DB-loader adapter; rebuild with tools/build_standalone_notebook.py."""\n'
+                       + "import numpy as np\nimport pandas as pd\n\n\n" + "\n\n\n".join(definitions) + "\n", encoding="utf-8")
+    print(adapter)
 
 
 if __name__ == "__main__":

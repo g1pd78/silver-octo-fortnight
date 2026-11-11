@@ -9,7 +9,7 @@ from .config import Config, month_start, origin, days
 from .data import Inputs, load_raw, prepare_actual, raw_asof, daily_actual, numeric, split_dated_frame
 from .features import FeatureBuilder
 from .models import candidates, reconcile, specs, spec_id
-from .export import upload_frame, database_upload_frame
+from .export import upload_frame, database_upload_frame, aggregate_database_upload
 
 
 def evaluate(forecast, actual, config):
@@ -315,6 +315,7 @@ class ForecastRunner:
             raise FileExistsError(f"A different frozen forecast already exists in {out}; choose a new output_dir")
         forecast_path.write_bytes(payload)
         upload.to_csv(out / "forecast_upload.csv", index=False, encoding="utf-8-sig", date_format="%Y-%m-%d")
+        aggregate_database_upload(upload).to_csv(out / "forecast_upload_total.csv", index=False, encoding="utf-8-sig", date_format="%Y-%m-%d")
         daily_upload.to_csv(out / "forecast_daily_totals.csv", index=False, encoding="utf-8-sig", date_format="%Y-%m-%d")
         json_write(out / "forecast_run_status.json", self.target_plan_status())
         json_write(out / "forecast_upload_schema.json", {
@@ -425,6 +426,7 @@ def _run(df, plan_df=None, actual_df=None, *, config=None, forecast_month=None,
         segment_comparison, comparison, score = runner.compare(actual_df=actual_df, save=save)
     return {
         "forecast": forecast, "upload": database_upload_frame(forecast, config),
+        "upload_total": aggregate_database_upload(database_upload_frame(forecast, config)),
         "daily_totals": upload_frame(forecast, config), "plan_status": runner.target_plan_status(),
         "comparison": comparison, "segment_comparison": segment_comparison,
         "metrics": score, "ranking": ranking, "control": control, "selection": selection,
