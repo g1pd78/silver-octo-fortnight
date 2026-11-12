@@ -117,6 +117,7 @@ class ForecastRunner:
             "history_start": str(h.date.min().date()), "history_end": str(h.date.max().date()),
             "raw_rows": len(h), "negative_daily_fact_rows": int(h.fact.lt(0).sum()),
             "raw_plan_negative_rows": int(h.target.lt(0).sum()),
+            "plan_downward_adjustments": int(h.target.lt(0).sum()) if c.plan_mode == "cumulative" else 0,
             "raw_vintage_mode": "timestamped" if c.raw_available_column else "retrospective_reconstructed",
             "input_mode": "dataframes" if self._from_frames else "sqlite",
             "plan_source": "df_plan" if self._from_frames else f"{c.plan_table or c.raw_table}.{c.plan_value_column}",
@@ -368,6 +369,13 @@ class ForecastRunner:
         json_write(out / "audit.json", audit)
         monthly.to_csv(out / "history_months.csv", index=False, encoding="utf-8-sig")
         daily.to_csv(out / "history_daily_audit.csv", index=False, encoding="utf-8-sig")
+        historical_changes = daily.loc[daily.raw_plan.lt(0), ["date", *c.segments, "raw_plan"]].rename(columns={"raw_plan": "plan_change"})
+        historical_changes["source"] = "historical_snapshot"
+        target_plan = self.inputs.plan(c.forecast_month)
+        future_changes = target_plan.loc[target_plan.plan.lt(0), ["date", *c.segments, "plan"]].rename(columns={"plan": "plan_change"})
+        future_changes["source"] = "target_plan"
+        pd.concat([historical_changes, future_changes], ignore_index=True).to_csv(
+            out / "plan_adjustments.csv", index=False, encoding="utf-8-sig", date_format="%Y-%m-%d")
         # Hash prediction inputs only, never the database file containing target actuals.
         json_write(out / "manifest.json", {"config": c.as_dict(), "selection": self.selection,
                    "history_sha256": digest, "plan_sha256": inputs, "versions": versions,

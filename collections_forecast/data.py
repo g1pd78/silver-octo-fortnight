@@ -162,6 +162,8 @@ def prepare_actual(frame, config, *, before=None, month=None):
     if frame.dt_in.isna().any() or frame.dt_in.gt(frame.report_dt).any():
         raise ValueError("Invalid or future dt_in in an actual row")
     numeric(frame, [c for c in ["fact", "w1", "w2", "cession", "write_off", "target", "acc_count"] if c in frame])
+    if "target" in frame and frame.target.lt(0).any():
+        raise ValueError("Source plan amounts must be nonnegative; decreases between cumulative snapshots are allowed")
     for col in ["avg_dpd", "avg_pvr"]:
         if col not in frame:
             continue
@@ -435,13 +437,15 @@ def aggregate_plan(rows, config, month, allow_missing=False):
             return pd.DataFrame({"date": pd.Series(dtype="datetime64[ns]"),
                                  **{d: pd.Series(dtype=str) for d in dims}, "plan": pd.Series(dtype=float)})
         result = pd.concat(parts).groupby(["date", *dims], as_index=False).plan.agg(lambda s: s.sum(skipna=False))
-        if result.plan.lt(0).any():
+        if config.plan_mode == "daily" and result.plan.lt(0).any():
             raise ValueError("Daily plans must be nonnegative")
         return result.sort_values([*dims, "date"]).reset_index(drop=True)
     numeric(frame, ["plan"])
+    if frame.plan.lt(0).any():
+        raise ValueError("Source plan amounts must be nonnegative; decreases between cumulative snapshots are allowed")
     frame = frame.reset_index(drop=True)
     frame["plan"] = cohort_daily(frame, "plan", config.plan_mode, config)
-    if frame.plan.lt(0).any():
+    if config.plan_mode == "daily" and frame.plan.lt(0).any():
         raise ValueError("Daily plans must be nonnegative; resolve corrections explicitly")
     # dt_in is retained until here: each cohort contributes once to its segment/day.
     result = frame.groupby(["date", *dims], as_index=False).plan.sum()

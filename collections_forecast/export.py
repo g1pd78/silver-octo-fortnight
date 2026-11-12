@@ -27,8 +27,11 @@ def upload_frame(pred, config):
     f["plan"] = pd.to_numeric(f.plan, errors="raise")
     if not np.isfinite(f.forecast_daily).all():
         raise ValueError("Upload: forecast_daily must be finite monetary amounts")
-    if np.isinf(f.plan).any() or f.plan.lt(0).any():
-        raise ValueError("Upload: plan must be nonnegative; missing plan stays NULL")
+    if np.isinf(f.plan).any() or (config.plan_mode == "daily" and f.plan.lt(0).any()):
+        raise ValueError("Upload: daily source plans must be nonnegative; missing plan stays NULL")
+    cumulative = f.sort_values([*dims, "date"]).groupby(dims).plan.transform(lambda s: s.cumsum(skipna=False))
+    if cumulative.lt(0).any():
+        raise ValueError("Upload: cumulative plan snapshots must be nonnegative")
     total = f.groupby("date", as_index=False).agg(
         forecast_daily=("forecast_daily", "sum"),
         plan_daily=("plan", lambda s: s.sum(skipna=False)))

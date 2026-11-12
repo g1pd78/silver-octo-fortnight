@@ -67,16 +67,22 @@ def profile_forecast(history, features, config, calendar=False, builder=None):
         keys = [*dims, "weekday", "month_start_flag", "is_workday", "is_holiday"]
     else:
         keys = [*dims, "day"]
-    grouped = h.groupby(keys, as_index=False).agg(num=("fact", "sum"), den=("target", "sum"))
-    grouped["ratio"] = grouped.num / grouped.den.replace(0, np.nan)
-    segment = h.groupby(dims, as_index=False).agg(num=("fact", "sum"), den=("target", "sum"))
-    segment["fallback_ratio"] = segment.num / segment.den.replace(0, np.nan)
-    global_ratio = h.fact.sum() / h.target.sum() if h.target.sum() else 1.0
+    # A negative change in a cumulative PLAN is a revision, not a request for
+    # negative collections on that day. Learn calendar-shaped daily collection
+    # fractions of the final monthly plan instead of fact / signed plan change.
+    monthly_plan = h.groupby(["month", *dims]).target.transform("sum")
+    h["daily_fraction"] = h.fact / monthly_plan.where(monthly_plan.gt(0))
+    grouped = h.groupby(keys, as_index=False).agg(ratio=("daily_fraction", "mean"))
+    segment = h.groupby(dims, as_index=False).agg(fallback_ratio=("daily_fraction", "mean"))
+    global_ratio = h.daily_fraction.mean()
+    if not np.isfinite(global_ratio):
+        global_ratio = 0.0
     f = features.merge(grouped[[*keys, "ratio"]], on=keys, how="left", validate="many_to_one")
     f = f.merge(segment[[*dims, "fallback_ratio"]], on=dims, how="left", validate="many_to_one")
-    # Extrapolate a segment's recent execution level using a known future daily plan.
+    # Scale by the known monthly endpoint; signed plan adjustments remain only
+    # in the official KPI denominator and other models' calendar features.
     ratio = f.ratio.fillna(f.fallback_ratio).fillna(global_ratio)
-    predicted_daily = f.plan * ratio
+    predicted_daily = f.plan_month * ratio
     return predicted_daily.groupby([f[c] for c in dims]).cumsum().to_numpy()
 
 
