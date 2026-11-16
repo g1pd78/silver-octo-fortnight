@@ -6,9 +6,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from .config import Config, month_start, origin, days
-from .data import Inputs, load_raw, prepare_actual, raw_asof, daily_actual, numeric, split_dated_frame
+from .data import Inputs, PlanUnavailableError, load_raw, prepare_actual, raw_asof, daily_actual, numeric, split_dated_frame
 from .features import FeatureBuilder
-from .models import candidates, reconcile, specs, spec_id
+from .models import ModelHistoryUnavailableError, candidates, reconcile, specs, spec_id
 from .export import upload_frame, database_upload_frame, aggregate_database_upload, legacy_dashboard_upload
 
 
@@ -108,6 +108,8 @@ class ForecastRunner:
         self.development_curves = pd.DataFrame()
         self.control_curves = pd.DataFrame()
         self.report_verified = False
+        self._historical_plan_issues = None
+        self._model_fallback_issues = []
 
     def audit(self):
         c = self.config
@@ -136,15 +138,48 @@ class ForecastRunner:
             part = daily[daily.date.dt.strftime("%Y-%m") == m]
             expected = days(m)
             rows.append({"month": m, "observed_days": part.date.nunique(), "expected_days": len(expected),
-                         "fact_sum": float(part.fact.sum()), "raw_plan_sum": float(part.raw_plan.sum())})
+                         "fact_sum": float(part.fact.sum()), "raw_plan_sum": part.raw_plan.sum(skipna=False)})
         # Build target features now so missing frozen portfolios/plan keys fail before a long backtest.
         if not self.needs_money_fallback():
-            self.builder.build(self.history, c.forecast_month)
-        report["missing_future_plan_fallback"] = self.needs_money_fallback()
+            try:
+                self.builder.build(self.history, c.forecast_month)
+            except PlanUnavailableError as exc:
+                self._activate_money_fallback(c.forecast_month, "forecast_inputs", exc)
+        status = self.target_plan_status()
+        report["missing_future_plan_fallback"] = bool(status["missing_plan_cells"] or status["missing_segments"]
+                                                      or not len(self.inputs.plan(c.forecast_month)))
+        report["money_fallback"] = status["mode"] == "money_fallback"
+        report["validation"] = status["validation"]
         return report, pd.DataFrame(rows), daily
 
     def needs_money_fallback(self):
         return self.target_plan_status()["mode"] == "money_fallback"
+
+    def _activate_money_fallback(self, month, phase, error):
+        issue = {"month": str(month), "phase": phase, "status": "history_unavailable", "reason": str(error)}
+        self._model_fallback_issues.append(issue)
+        self.fold_log.append(issue)
+        self.selection = None
+        for attr in ["ranking", "development_scores", "development_curves", "control_scores", "control_curves"]:
+            setattr(self, attr, pd.DataFrame())
+        print(f"Money fallback: {phase} {month}: {error}")
+
+    def historical_plan_issues(self):
+        """Preflight validation months before fitting; never catch corrupt inputs."""
+        if self._historical_plan_issues is None:
+            issues = []
+            c = self.config
+            for phase, start, end in [("development", c.development_start, c.development_end),
+                                      ("control", c.control_start, c.control_end)]:
+                for month in pd.period_range(start, end, freq="M"):
+                    try:
+                        self.inputs.plan(str(month))
+                    except PlanUnavailableError as exc:
+                        issues.append({"month": str(month), "phase": phase,
+                                       "status": "plan_unavailable", "reason": str(exc)})
+            self._historical_plan_issues = issues
+            self.fold_log.extend(issues)
+        return list(self._historical_plan_issues)
 
     def target_plan_status(self):
         plan = self.inputs.plan(self.config.forecast_month)
@@ -163,7 +198,15 @@ class ForecastRunner:
         absent = missing.loc[missing._merge.eq("left_only"), dims]
         if len(absent):
             reasons.append(f"В плане нет {len(absent)} сегментов, присутствовавших в недавней истории.")
+        historical_issues = self.historical_plan_issues() if not reasons else (self._historical_plan_issues or [])
+        if historical_issues:
+            months = ", ".join(sorted({entry["month"] for entry in historical_issues}))
+            reasons.append(f"Недоступен план исторической проверки: {months}. Денежный прогноз строится по истории сборов; подбор и контроль моделей не выполнены.")
+        reasons.extend(f"Недостаточно истории для модели ({i['phase']}, {i['month']}): {i['reason']}"
+                       for i in self._model_fallback_issues)
         return {"mode": "money_fallback" if reasons else "selected_model", "reasons": reasons,
+                "historical_plan_issues": historical_issues,
+                "model_history_issues": list(self._model_fallback_issues),
                 "forecast_grain": self.config.forecast_grain,
                 "missing_plan_cells": missing_cells, "missing_segments": len(absent),
                 "missing_plan_dates": plan.loc[plan.plan.isna(), "date"].drop_duplicates().dt.strftime("%Y-%m-%d").tolist(),
@@ -212,6 +255,8 @@ class ForecastRunner:
         return f
 
     def select(self):
+        if self.needs_money_fallback():
+            return pd.DataFrame(), None
         c = self.config
         rows, curves, specifications = [], [], {}
         expected_months = [str(m) for m in pd.period_range(c.development_start, c.development_end, freq="M")]
@@ -238,6 +283,9 @@ class ForecastRunner:
                     raise ValueError("incomplete or unplanned facts on evaluation grid")
                 self.fold_log.append({"month": month, "phase": "development", "status": "ok"})
                 print(f"Development {month}: {len(leaves)} segment models, {len(totals)} total models")
+            except (PlanUnavailableError, ModelHistoryUnavailableError) as exc:
+                self._activate_money_fallback(month, "development", exc)
+                return pd.DataFrame(), None
             except ValueError as exc:
                 self.fold_log.append({"month": month, "phase": "development", "status": "failed", "reason": str(exc)})
                 if c.require_all_folds:
@@ -262,13 +310,19 @@ class ForecastRunner:
         return ranking, dict(self.selection)
 
     def control(self):
+        if self.needs_money_fallback():
+            return pd.DataFrame()
         if self.selection is None:
             raise ValueError("Run select() first, or load a previously frozen selection")
         c = self.config
         rows, curves = [], []
         for m in pd.period_range(c.control_start, c.control_end, freq="M"):
             month = str(m)
-            x, leaves, totals = self._predict_candidates(month)
+            try:
+                x, leaves, totals = self._predict_candidates(month)
+            except (PlanUnavailableError, ModelHistoryUnavailableError) as exc:
+                self._activate_money_fallback(month, "control", exc)
+                return pd.DataFrame()
             pred = self._apply(x, leaves, totals, self.selection)
             _, total = evaluate(pred, self._truth(month), c)
             score = metrics(total, c)
@@ -288,9 +342,10 @@ class ForecastRunner:
             self.selection = dict(selection)
         if self.needs_money_fallback():
             from .fallback import money_forecast
+            self.selection = None
             pred = money_forecast(self.history, self.inputs.plan(self.config.forecast_month), self.config)
             self.status.append({"model": "money_fallback", "status": "available",
-                                "reason": "Official future plan incomplete; forecast based on historical collections"})
+                                "reason": "; ".join(self.target_plan_status()["reasons"])})
             pred["forecast_efficiency_pct"] = 100 * pred.forecast_cumulative / pred.plan_cumulative.where(pred.plan_cumulative.gt(0))
             self.forecast_frame = pred
             if save:
@@ -298,7 +353,11 @@ class ForecastRunner:
             return pred
         if self.selection is None:
             raise ValueError("Run select() or supply a frozen selection")
-        x, leaves, totals = self._predict_candidates(self.config.forecast_month)
+        try:
+            x, leaves, totals = self._predict_candidates(self.config.forecast_month)
+        except (PlanUnavailableError, ModelHistoryUnavailableError) as exc:
+            self._activate_money_fallback(self.config.forecast_month, "forecast", exc)
+            return self.forecast(save=save)
         pred = self._apply(x, leaves, totals, self.selection)
         pred["forecast_efficiency_pct"] = 100 * pred.forecast_cumulative / pred.plan_cumulative.where(pred.plan_cumulative.gt(0))
         self.forecast_frame = pred
@@ -431,6 +490,10 @@ def _run(df, plan_df=None, actual_df=None, *, config=None, forecast_month=None,
         ranking, selection = runner.select()
         control = runner.control()
     forecast = runner.forecast(save=save)
+    if runner.needs_money_fallback():
+        ranking, selection, control = pd.DataFrame(), None, pd.DataFrame()
+        audit["money_fallback"] = True
+        audit["validation"] = "not_run"
 
     segment_comparison = comparison = score = None
     if actual_df is not None and not actual_df.empty:

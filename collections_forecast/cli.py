@@ -88,6 +88,9 @@ def main(argv=None):
                 _, selection = runner.select()
                 control = runner.control()
             runner.forecast()
+            selection = runner.selection
+            if runner.needs_money_fallback():
+                control = pd.DataFrame()
             score = None
             if args.actual:
                 _, _, score = runner.compare(actual_df=read_frame(args.actual, config))

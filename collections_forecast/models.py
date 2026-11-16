@@ -3,7 +3,11 @@ import warnings
 import numpy as np
 import pandas as pd
 from .config import month_start, origin, days
-from .data import raw_asof, daily_actual
+from .data import PlanUnavailableError, raw_asof, daily_actual
+
+
+class ModelHistoryUnavailableError(ValueError):
+    """Insufficient usable history for fitted models; cash fallback may still run."""
 
 
 def label_features(features, actual, config):
@@ -29,11 +33,11 @@ def training_data(history, month, config, builder):
             a = actual[actual.month == previous]
             f = label_features(x, a, config)
             if f is None:
-                raise ValueError("missing segment-day facts; zeros were not imputed")
+                raise ModelHistoryUnavailableError("missing segment-day facts; zeros were not imputed")
             total = builder.total(x)
             actual_total = a.groupby("date").fact.sum().reindex(total.date)
             if actual_total.isna().any():
-                raise ValueError("missing daily total")
+                raise ModelHistoryUnavailableError("missing daily total")
             total["fact"] = actual_total.to_numpy()
             total["fact_cumulative"] = total.fact.cumsum()
             total["efficiency"] = total.fact_cumulative / total.plan_cumulative.replace(0, np.nan)
@@ -41,11 +45,11 @@ def training_data(history, month, config, builder):
             total["training_month"] = previous
             frames.append(f)
             totals.append(total)
-        except ValueError as exc:
+        except (PlanUnavailableError, ModelHistoryUnavailableError) as exc:
             skipped.append({"month": previous, "reason": str(exc)})
     if not frames:
         reasons = "; ".join(f"{row['month']}: {row['reason']}" for row in skipped)
-        raise ValueError(f"No complete training months before {month}. Reasons by month: {reasons or 'no earlier observations'}")
+        raise ModelHistoryUnavailableError(f"No complete training months before {month}. Reasons by month: {reasons or 'no earlier observations'}")
     return pd.concat(frames, ignore_index=True), pd.concat(totals, ignore_index=True), skipped
 
 
@@ -54,7 +58,7 @@ def profile_forecast(history, features, config, calendar=False, builder=None):
     h = raw_asof(history, config, origin(features.date.iloc[0].strftime("%Y-%m")))
     h = h[h.date >= features.date.min() - pd.DateOffset(months=config.reference_months)].copy()
     if h.empty:
-        raise ValueError("Reference profile has no historical data")
+        raise ModelHistoryUnavailableError("Reference profile has no historical data")
     if not calendar:
         return normalized_reference(h, features, config)
     h["weekday"] = h.date.dt.day_of_week
@@ -70,13 +74,13 @@ def profile_forecast(history, features, config, calendar=False, builder=None):
     # A negative change in a cumulative PLAN is a revision, not a request for
     # negative collections on that day. Learn calendar-shaped daily collection
     # fractions of the final monthly plan instead of fact / signed plan change.
-    monthly_plan = h.groupby(["month", *dims]).target.transform("sum")
+    monthly_plan = h.groupby(["month", *dims]).target.transform(lambda s: s.sum(skipna=False))
     h["daily_fraction"] = h.fact / monthly_plan.where(monthly_plan.gt(0))
     grouped = h.groupby(keys, as_index=False).agg(ratio=("daily_fraction", "mean"))
     segment = h.groupby(dims, as_index=False).agg(fallback_ratio=("daily_fraction", "mean"))
     global_ratio = h.daily_fraction.mean()
     if not np.isfinite(global_ratio):
-        global_ratio = 0.0
+        raise ModelHistoryUnavailableError("No known positive monthly plan for calendar reference")
     f = features.merge(grouped[[*keys, "ratio"]], on=keys, how="left", validate="many_to_one")
     f = f.merge(segment[[*dims, "fallback_ratio"]], on=dims, how="left", validate="many_to_one")
     # Scale by the known monthly endpoint; signed plan adjustments remain only
@@ -94,8 +98,9 @@ def normalized_reference(history, features, config):
     def curves(part, n):
         result = []
         for month, group in part.groupby("month", sort=True):
-            group = group.groupby("date", as_index=False)[["fact", "raw_plan"]].sum().sort_values("date")
-            if not pd.DatetimeIndex(group.date).equals(days(month)) or group.raw_plan.sum() <= 0:
+            group = group.groupby("date", as_index=False)[["fact", "raw_plan"]].agg(lambda s: s.sum(skipna=False)).sort_values("date")
+            if (not pd.DatetimeIndex(group.date).equals(days(month)) or group.raw_plan.isna().any()
+                    or group.raw_plan.sum() <= 0):
                 continue
             cumulative = np.r_[0.0, group.fact.cumsum().to_numpy() / group.raw_plan.sum()]
             result.append(np.interp(np.arange(1, n + 1) / n, np.linspace(0, 1, len(cumulative)), cumulative))
@@ -103,7 +108,7 @@ def normalized_reference(history, features, config):
     n = features.date.nunique()
     fallback = curves(h, n)
     if fallback is None:
-        raise ValueError("No complete reference month; missing facts were not replaced with zeros")
+        raise ModelHistoryUnavailableError("No complete reference month; missing facts/plans were not replaced with zeros")
     prediction = pd.Series(index=features.index, dtype=float)
     for key, group in features.groupby(dims, sort=False):
         key = key if isinstance(key, tuple) else (key,)
@@ -156,7 +161,7 @@ def candidates(history, month, config, builder):
     train, train_total, skipped = training_data(history, month, config, builder)
     status.extend({"model": "training_month", "status": "excluded", **item} for item in skipped)
     if train.training_month.nunique() < config.min_train_months:
-        raise ValueError(f"Only {train.training_month.nunique()} complete training months before {month}; need {config.min_train_months}")
+        raise ModelHistoryUnavailableError(f"Only {train.training_month.nunique()} complete training months before {month}; need {config.min_train_months}")
     totals["total_calendar_regression"] = calendar_regression(train_total, total_x)
     recent = train_total[train_total.training_month.isin(sorted(train_total.training_month.unique())[-config.reference_months:])]
     by_day = recent.groupby("day").efficiency.median()
@@ -206,7 +211,7 @@ def sarimax_forecast(history, total_x, month, config, builder):
     from statsmodels.tsa.statespace.sarimax import SARIMAX
     h = raw_asof(history, config, origin(month))
     dates = pd.date_range(h.date.min(), month_start(month) - pd.Timedelta(days=1), freq="D")
-    a = h.groupby("date")[["fact", "target"]].sum().reindex(dates)
+    a = h.groupby("date")[["fact", "target"]].agg(lambda s: s.sum(skipna=False)).reindex(dates)
     if a.isna().any().any():
         raise ValueError("SARIMAX needs complete daily history; missing days were not imputed")
     calendars = pd.concat([builder.calendar(m) for m in pd.period_range(dates.min(), dates.max(), freq="M")])

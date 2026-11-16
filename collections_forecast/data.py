@@ -161,7 +161,11 @@ def prepare_actual(frame, config, *, before=None, month=None):
         raise ValueError("report_month must be the first day of the month")
     if frame.dt_in.isna().any() or frame.dt_in.gt(frame.report_dt).any():
         raise ValueError("Invalid or future dt_in in an actual row")
-    numeric(frame, [c for c in ["fact", "w1", "w2", "cession", "write_off", "target", "acc_count"] if c in frame])
+    numeric(frame, [c for c in ["fact", "w1", "w2", "cession", "write_off", "acc_count"] if c in frame])
+    if "target" in frame:
+        frame["target"] = pd.to_numeric(frame.target, errors="raise")
+        if np.isinf(frame.target).any():
+            raise ValueError("Infinite source plan amounts")
     if "target" in frame and frame.target.lt(0).any():
         raise ValueError("Source plan amounts must be nonnegative; decreases between cumulative snapshots are allowed")
     for col in ["avg_dpd", "avg_pvr"]:
@@ -193,7 +197,7 @@ def prepare_actual(frame, config, *, before=None, month=None):
     return frame
 
 
-def cohort_daily(frame, value, mode, config):
+def cohort_daily(frame, value, mode, config, missing_error=ValueError):
     """Convert stable cohort snapshots without bridging gaps or erasing corrections."""
     if mode == "daily":
         return frame[value].copy()
@@ -211,7 +215,7 @@ def cohort_daily(frame, value, mode, config):
         expected = pd.date_range(start, end, freq="D")
         if not pd.DatetimeIndex(active.date).equals(expected):
             missing = expected.difference(pd.DatetimeIndex(active.date))
-            raise ValueError(f"Cumulative {value}: missing cohort snapshots from {start.date()} to {end.date()}; "
+            raise missing_error(f"Cumulative {value}: missing cohort snapshots from {start.date()} to {end.date()}; "
                              f"key={group[keys].iloc[0].to_dict()}; missing dates={missing.strftime('%Y-%m-%d').tolist()[:10]}. "
                              "If DPD/PVR segments change between snapshots, aggregate to a stable grain before differencing; "
                              "otherwise supply a complete stable cohort series or independently reconciled daily amounts")
@@ -281,7 +285,7 @@ def daily_actual(raw, config):
     raw = raw_asof(raw, config, pd.Timestamp.max - pd.Timedelta(days=1))
     aggregates = {"fact": ("fact", "sum")}
     if "target" in raw:
-        aggregates["raw_plan"] = ("target", "sum")
+        aggregates["raw_plan"] = ("target", lambda s: s.sum(skipna=False))
     aggregates["raw_rows"] = ("fact", "size")
     return raw.groupby(["date", *config.segments], as_index=False, dropna=False).agg(**aggregates)
 
@@ -391,17 +395,21 @@ def split_dated_frame(df, config):
     return history, plan, actual
 
 
+class PlanUnavailableError(ValueError):
+    """Missing/zero official plans prevent KPI validation, not money prediction."""
+
+
 def aggregate_plan(rows, config, month, allow_missing=False):
     dims = list(config.segments)
     frame = rows.loc[rows.report_month.eq(month_start(month))].copy()
     if frame.empty and not allow_missing:
-        raise ValueError(f"No daily plan for {month}")
+        raise PlanUnavailableError(f"No daily plan for {month}")
     frame["date"] = frame.report_dt
     key = ["date", "dt_in", *dims]
     if "plan_available_at" in frame:
         frame = frame[frame.plan_available_at <= origin(month)]
         if frame.empty and not allow_missing:
-            raise ValueError(f"No plan version available before {month}")
+            raise PlanUnavailableError(f"No plan version available before {month}")
         if frame.duplicated([*key, "plan_available_at"]).any():
             raise ValueError("Duplicate plan cohort and availability timestamp")
         frame = frame.sort_values("plan_available_at").drop_duplicates(key, keep="last")
@@ -440,11 +448,16 @@ def aggregate_plan(rows, config, month, allow_missing=False):
         if config.plan_mode == "daily" and result.plan.lt(0).any():
             raise ValueError("Daily plans must be nonnegative")
         return result.sort_values([*dims, "date"]).reset_index(drop=True)
-    numeric(frame, ["plan"])
+    frame["plan"] = pd.to_numeric(frame.plan, errors="raise")
+    if np.isinf(frame.plan).any():
+        raise ValueError("Infinite source plan amounts")
     if frame.plan.lt(0).any():
         raise ValueError("Source plan amounts must be nonnegative; decreases between cumulative snapshots are allowed")
+    if frame.plan.isna().any():
+        raise PlanUnavailableError(f"{month}: unknown source plan cells")
     frame = frame.reset_index(drop=True)
-    frame["plan"] = cohort_daily(frame, "plan", config.plan_mode, config)
+    frame["plan"] = cohort_daily(frame, "plan", config.plan_mode, config,
+                                 missing_error=PlanUnavailableError)
     if config.plan_mode == "daily" and frame.plan.lt(0).any():
         raise ValueError("Daily plans must be nonnegative; resolve corrections explicitly")
     # dt_in is retained until here: each cohort contributes once to its segment/day.
@@ -469,9 +482,9 @@ def aggregate_plan(rows, config, month, allow_missing=False):
         result = pd.concat([result, pd.DataFrame(added)], ignore_index=True)
     counts = result.groupby(dims).date.nunique()
     if not counts.eq(len(expected_days)).all():
-        raise ValueError(f"{month}: every segment needs a plan for every day; missing plan rows are not assumed zero")
+        raise PlanUnavailableError(f"{month}: every segment needs a plan for every day; missing plan rows are not assumed zero")
     if result.plan.sum() <= 0:
-        raise ValueError(f"{month}: the entire monthly plan is zero; efficiency cannot be assessed")
+        raise PlanUnavailableError(f"{month}: the entire monthly plan is zero; efficiency cannot be assessed")
     return result.sort_values([*dims, "date"]).reset_index(drop=True)
 
 

@@ -1,4 +1,4 @@
-"""Money-only forecast when the official future plan is unavailable."""
+"""Money forecast when future plans or historical validation plans are unavailable."""
 import numpy as np
 import pandas as pd
 from .config import days, origin

@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from .config import month_start, origin, days
-from .data import raw_asof, numeric
+from .data import PlanUnavailableError, raw_asof, numeric
 
 
 # Russian production-calendar transfers for the historical forecast window.
@@ -161,7 +161,7 @@ class FeatureBuilder:
         portfolio = self.portfolio(h, month)
         absent = portfolio[dims].merge(f[dims].drop_duplicates(), how="left", indicator=True, on=dims)
         if absent._merge.eq("left_only").any():
-            raise ValueError(f"{month}: portfolio segments missing from plan; supply explicit zero-plan rows")
+            raise PlanUnavailableError(f"{month}: portfolio segments missing from plan; supply explicit zero-plan rows")
         f = f.merge(portfolio, how="left", on=dims, validate="many_to_one")
         f["new_segment"] = f.debt.isna().astype(int)
         f["debt"] = f.debt.fillna(0)
@@ -173,11 +173,11 @@ class FeatureBuilder:
             cutoff = month_start(month) - pd.DateOffset(months=n)
             part = h[h.date >= cutoff]
             stats = part.groupby(dims, as_index=False).agg(
-                past_fact=("fact", "sum"), past_plan=("target", "sum"))
+                past_fact=("fact", "sum"), past_plan=("target", lambda s: s.sum(skipna=False)))
             stats[f"history_eff_{n}m"] = stats.past_fact / stats.past_plan.replace(0, np.nan)
             stats = stats.rename(columns={"past_fact": f"history_fact_{n}m", "past_plan": f"history_plan_{n}m"})
             f = f.merge(stats, on=dims, how="left", validate="many_to_one")
-            denominator = part.target.sum()
+            denominator = part.target.sum(skipna=False)
             f[f"total_history_eff_{n}m"] = part.fact.sum() / denominator if denominator else np.nan
         for n in (7, 14, 28):
             part = h[h.date >= month_start(month) - pd.Timedelta(days=n)]

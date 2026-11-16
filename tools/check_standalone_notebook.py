@@ -48,6 +48,38 @@ np.testing.assert_allclose(filtered_csv.groupby('report_dt').fact.sum(), result[
 print('Standalone notebook execution, aggregate and filtered CSVs passed')
 """, encoding="utf-8")
         subprocess.run([sys.executable, "-I", str(script)], cwd=directory, check=True)
+    # Exercise the exact non-demo notebook path with RR cumulative snapshots and
+    # a missing historical plan, not just the installed package or demo defaults.
+    real_sources = [cell.source.replace('forecast_month="2026-11"', 'forecast_month="2026-09"')
+                    for cell in notebook.cells if cell.cell_type == "code"]
+    with tempfile.TemporaryDirectory() as directory:
+        script = Path(directory) / "missing_plan_check.py"
+        script.write_text("""import importlib.util
+assert importlib.util.find_spec('collections_forecast') is None
+import pandas as pd
+import numpy as np
+import plotly.io as pio
+pio.show = lambda *args, **kwargs: None
+def display(value):
+    pass
+dates = pd.date_range('2024-01-01', '2026-09-30')
+df = pd.DataFrame({'date': dates, 'fact': dates.day * 90., 'plan': dates.day * 100.})
+df.loc[df.date.dt.strftime('%Y-%m').eq('2026-01'), 'plan'] = np.nan
+""" + "\n\n".join(real_sources) + """
+assert result['plan_status']['mode'] == 'money_fallback'
+assert result['ranking'].empty and result['control'].empty
+assert result['plan_status']['validation'] == 'not_run'
+assert any(i['month'] == '2026-01' for i in result['plan_status']['historical_plan_issues'])
+uploaded = pd.read_csv('forecast_2026-09.csv')
+assert len(uploaded) == 30 and uploaded.report_dt.is_unique
+np.testing.assert_allclose(uploaded.plan, np.arange(1, 31) * 100.)
+np.testing.assert_allclose(uploaded.fact, result['forecast'].forecast_cumulative)
+assert uploaded.fact.iloc[-1] < 4000  # no second cumulative sum
+assert np.isfinite(result['forecast'].forecast_efficiency_pct).all()
+assert (Path(config.output_dir) / 'forecast_run_status.json').exists()
+print('Non-demo cumulative RR notebook with missing historical plan passed')
+""", encoding="utf-8")
+        subprocess.run([sys.executable, "-I", str(script)], cwd=directory, check=True)
 
 
 if __name__ == "__main__":
