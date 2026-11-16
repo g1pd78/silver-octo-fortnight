@@ -572,6 +572,8 @@ def _run(df, plan_df=None, actual_df=None, *, config=None, forecast_month=None,
         "daily_totals": upload_frame(forecast, config), "plan_status": runner.target_plan_status(),
         "comparison": comparison, "segment_comparison": segment_comparison,
         "metrics": score, "ranking": ranking, "control": control, "selection": selection,
+        "development_scores": getattr(runner, "development_scores", pd.DataFrame()),
+        "model_status": pd.DataFrame(runner.status),
         "audit": audit, "history_months": history_months, "report_checks": report_checks,
     }
     if save:

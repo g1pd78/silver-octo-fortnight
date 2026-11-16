@@ -3,6 +3,121 @@ import json
 import numpy as np
 import pandas as pd
 from .pipeline import json_write
+from .config import Config
+
+
+def diagnostic_panels(result, config):
+    """Small screenshot-friendly panels: percentages only, no monetary amounts."""
+    c = config.resolved()
+    status = result.get("plan_status") or {}
+    selection = result.get("selection") or {}
+    score = result.get("metrics") or {}
+    def number(value):
+        return "—" if value is None or pd.isna(value) else f"{float(value):.3f}"
+    def table(frame, columns):
+        if frame is None or frame.empty:
+            return "Нет результатов."
+        columns = {key: value for key, value in columns.items() if key in frame}
+        return frame[list(columns)].rename(columns=columns).to_string(index=False, float_format=lambda x: f"{x:.3f}")
+    metric_columns = {"month": "Месяц", "max_error_pp": "Макс.пп", "mae_pp": "MAE.пп",
+                      "bias_pp": "Сдвиг.пп", "hit_rate": "Попадания", "complete": "Полный"}
+    selected_id = (f"{selection['leaf']}|{selection.get('total') or 'bottom_up'}|{selection['weight']:g}"
+                   if selection else None)
+    lines = [f"1. ИТОГ {c.forecast_month} · screenshot-v2", f"Режим: {status.get('mode', 'неизвестен')}",
+             f"Выбор: {selected_id or 'резерв'}"]
+    if selection.get("weight") == 1 and selection.get("total"):
+        lines.append(f"Общий итог: 100% {selection['total']}; leaf не влияет на сумму.")
+    lines += [f"Оценено: {score.get('scored_days', 0)}; без оценки: {score.get('unscored_days', '—')}",
+              f"Полный месяц оценён: {score.get('complete', False)}; цель на доступных датах: {score.get('available_days_goal_achieved', False)}",
+              f"MAE: {number(score.get('mae_pp'))} п.п.; сдвиг: {number(score.get('bias_pp'))} п.п.; макс.: {number(score.get('max_error_pp'))} п.п.",
+              f"Попадания: {number(None if score.get('hit_rate') is None else 100 * score['hit_rate'])}%; последняя дата: {score.get('last_scored_date') or '—'}; ошибка: {number(score.get('last_scored_error_pp'))} п.п."]
+    comparison = result.get("comparison")
+    if comparison is not None and not comparison.empty and "absolute_error_pp" in comparison:
+        valid = comparison[comparison.absolute_error_pp.notna()].copy()
+        errors = valid.signed_error_pp
+        if len(errors) and errors.gt(0).all():
+            lines.append("Прогноз выше факта на всех оценённых датах.")
+        elif len(errors) and errors.lt(0).all():
+            lines.append("Прогноз ниже факта на всех оценённых датах.")
+        if len(valid):
+            valid["period"] = np.where(pd.to_datetime(valid.date).dt.day.le(5), "1–5", "6–конец")
+            groups = valid.groupby("period", sort=False).agg(days=("absolute_error_pp", "size"),
+                mae_pp=("absolute_error_pp", "mean"), bias_pp=("signed_error_pp", "mean"))
+            lines += ["Ошибка по части месяца:", table(groups.reset_index(),
+                       {"period": "Дни", "days": "Оценено", "mae_pp": "MAE.пп", "bias_pp": "Сдвиг.пп"})]
+    panels = ["\n".join(lines)]
+
+    ranking = result.get("ranking")
+    lines = ["2. ПОДБОР НА ПРОШЛЫХ МЕСЯЦАХ", "Критерий: сначала минимальный максимум ошибки, затем MAE."]
+    if ranking is not None and not ranking.empty:
+        ranked = ranking.copy()
+        ranked["rank"] = np.arange(1, len(ranked) + 1)
+        # At weight=1 all leaf choices have the same aggregate prediction.
+        # Collapse these aliases for display only; never modify the selection.
+        def identity(candidate):
+            leaf, total, weight = str(candidate).rsplit("|", 2)
+            return f"{total}|1" if float(weight) == 1 else str(candidate)
+        ranked["identity"] = ranked.candidate.map(identity)
+        shown = ranked.drop_duplicates("identity").head(3)
+        baselines = ranked[ranked.candidate.isin([f"{leaf}|bottom_up|0" for leaf in
+            ["plan_baseline", "plan_execution", "plan_execution_curve", "plan_execution_blend"]])]
+        shown = pd.concat([shown, baselines]).drop_duplicates("identity")
+        shown = shown.sort_values("rank")
+        shown["candidate"] = shown.identity
+        lines += ["Топ-3 разных общих прогнозов + простые варианты:", table(shown,
+            {"rank": "№", "candidate": "Модель", "months": "Мес.", "max_error_pp": "Макс.пп", "mae_pp": "MAE.пп"})]
+    else:
+        lines.append("Подбор не выполнен.")
+    dev = result.get("development_scores")
+    if selected_id and dev is not None and not dev.empty:
+        lines += ["Выбранная комбинация по месяцам подбора (не независимая проверка):",
+                  table(dev[dev.candidate.eq(selected_id)], metric_columns)]
+    panels.append("\n".join(lines))
+
+    control = result.get("control")
+    lines = ["3. КОНТРОЛЬ ВЫБРАННОЙ КОМБИНАЦИИ", "Попадания в таблице — доля от 0 до 1.", table(control, metric_columns)]
+    if control is not None and not control.empty and "max_error_pp" in control:
+        if control.max_error_pp.dropna().gt(c.tolerance_pp).any():
+            lines.append(f"На контроле есть превышения {c.tolerance_pp:g} п.п.; точность не подтверждена.")
+    for phase, part in status.get("validation_coverage", {}).items():
+        lines.append(f"{phase}: исключены {', '.join(part.get('excluded_months', [])) or 'нет'}")
+    lines += list(status.get("reasons", [])) + list(status.get("warnings", []))
+    panels.append("\n".join(lines))
+    model_status = result.get("model_status")
+    if model_status is not None and not model_status.empty and {"model", "status"} <= set(model_status):
+        missing = model_status[model_status.status.eq("unavailable")].drop_duplicates()
+        if not missing.empty:
+            panels.append("4. НЕДОСТУПНЫЕ МОДЕЛИ\n" + table(missing.head(8),
+                {"month": "Месяц", "model": "Модель", "reason": "Причина"}))
+    if result.get("diagnostic_load_warnings"):
+        panels.append("НЕПОЛНЫЙ НАБОР ФАЙЛОВ\n" + "\n".join(result["diagnostic_load_warnings"]))
+    return panels
+
+
+def load_saved_run_diagnostics(output_dir):
+    """Read saved results only. No database, training, selection or forecast writes."""
+    out = Path(output_dir)
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    config = Config(**{**manifest["config"], "output_dir": str(out)}).resolved()
+    result = {"selection": manifest.get("selection"), "diagnostic_load_warnings": []}
+    for key, filename in [("plan_status", "forecast_run_status.json"), ("metrics", "metrics.json")]:
+        path = out / filename
+        result[key] = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+        if not path.exists():
+            result["diagnostic_load_warnings"].append(f"Нет {filename}.")
+    for key, filename in [("comparison", "comparison_total.csv"), ("ranking", "development_ranking.csv"),
+                          ("development_scores", "development_scores.csv"), ("control", "control_scores.csv"),
+                          ("model_status", "model_status.csv"), ("forecast", "forecast.csv")]:
+        path = out / filename
+        result[key] = pd.DataFrame()
+        if path.exists():
+            try:
+                result[key] = pd.read_csv(path, encoding="utf-8-sig", **({"usecols": ["model"]} if key == "forecast" else {}))
+            except pd.errors.EmptyDataError:
+                pass
+        elif key in {"comparison", "forecast"} or (result.get("plan_status") or {}).get("mode") == "selected_model":
+            result["diagnostic_load_warnings"].append(f"Нет {filename}.")
+    return result, config
 
 
 def save_run_diagnostics(result, config):
@@ -16,7 +131,8 @@ def save_run_diagnostics(result, config):
         "enable_sarimax", "estimate_plan_tail", "allow_missing_plan_folds", "output_dir"]}
     def dump(value):
         return json.dumps(value, ensure_ascii=False, indent=2, default=str)
-    lines = ["ДИАГНОСТИКА ПРОГНОЗА · partial-validation-v1", "Настройки:", dump(settings),
+    summary = "\n\n".join(diagnostic_panels(result, c)) + "\n"
+    lines = [summary, "ПОДРОБНОСТИ · screenshot-v2", "Настройки:", dump(settings),
              "Фактически использованные модели:", dump(models),
              "Выбранная комбинация:", dump(result.get("selection")),
              "Режим, причины, предупреждения и покрытие исторической проверки:", dump(result.get("plan_status")),
@@ -36,6 +152,7 @@ def save_run_diagnostics(result, config):
     out = Path(c.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "diagnostics.txt").write_text(text, encoding="utf-8")
+    (out / "diagnostics_summary.txt").write_text(summary, encoding="utf-8")
     return text
 
 

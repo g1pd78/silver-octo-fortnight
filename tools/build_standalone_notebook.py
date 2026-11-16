@@ -151,10 +151,14 @@ print("Одна строка на дату. fact/plan — накопленные
 print("Поместите этот CSV рядом с upload_model_effect.py. Его чтение долга и загрузку в БД оставьте прежними.")
 '''), nbformat.v4.new_markdown_cell('''## Диагностика запуска
 
-Вывод ниже содержит режим, модели, причины перехода в резерв, исключённые месяцы,
-метрики и десять худших дат. Он также записывается в `output_dir/diagnostics.txt`.
-Этот файл можно прислать целиком для проверки — вручную набирать команды не нужно.
-'''), nbformat.v4.new_code_cell('''print(save_run_diagnostics(result, config))
+Короткие блоки ниже подходят для скриншотов: итог, подбор и контроль. Денежных сумм в них нет.
+Краткая версия сохраняется в `output_dir/diagnostics_summary.txt`, подробная — в `diagnostics.txt`.
+Для уже рассчитанного прогноза можно открыть отдельный `forecast_diagnostics.ipynb`: переобучение не требуется.
+'''), nbformat.v4.new_code_cell('''_ = save_run_diagnostics(result, config)
+diagnostics = diagnostic_panels(result, config)
+print(diagnostics[0])
+'''), nbformat.v4.new_code_cell('''print(diagnostics[1])
+'''), nbformat.v4.new_code_cell('''print("\\n\\n".join(diagnostics[2:]))
 '''), nbformat.v4.new_markdown_cell('''## Отклонение от факт/план, п.п. — по доступным датам
 
 Эту ячейку можно запускать повторно после обновления фактов в `df`: используется готовый
@@ -198,7 +202,8 @@ else:
     evaluation_dir.mkdir(parents=True, exist_ok=True)
     pp_table.to_csv(evaluation_dir / "comparison_available_pp.csv", index=False, encoding="utf-8-sig")
     save_report(segment_pp, comparison_pp, score_pp, config)
-    print(save_run_diagnostics(result, config))
+    _ = save_run_diagnostics(result, config)
+    print(diagnostic_panels(result, config)[0])
 '''), nbformat.v4.new_markdown_cell('''## CSV с фильтрами продукта, DPD, PVR, ТБ и входов
 
 Подготовьте `df_layout`: полный **известный на момент прогноза** план целевого месяца по строкам
@@ -258,6 +263,32 @@ else:
     adapter.write_text('"""Generated DB-loader adapter; rebuild with tools/build_standalone_notebook.py."""\n'
                        + "import numpy as np\nimport pandas as pd\n\n\n" + "\n\n\n".join(definitions) + "\n", encoding="utf-8")
     print(adapter)
+    diagnostic_source = (ROOT / "collections_forecast" / "reporting.py").read_text(encoding="utf-8")
+    diagnostic_names = {"diagnostic_panels", "load_saved_run_diagnostics", "save_run_diagnostics"}
+    diagnostic_defs = [ast.get_source_segment(diagnostic_source, node) for node in ast.parse(diagnostic_source).body
+                       if isinstance(node, ast.FunctionDef) and node.name in diagnostic_names]
+    helper_cells = [nbformat.v4.new_markdown_cell('''# Диагностика сохранённого прогноза
+
+Прочитывает только результаты из указанной папки. Не обращается к БД, не обучает модель,
+не меняет прогноз и его оценку. Требуются Python, pandas и numpy; пакет проекта не нужен.
+Откройте рядом с основным ноутбуком. Проверьте `OUTPUT_DIR` и нажмите **Run All**.
+Пришлите скриншоты трёх коротких блоков ниже — исходные файлы и денежные суммы не нужны.
+'''), nbformat.v4.new_code_cell("from pathlib import Path\nimport json\nimport numpy as np\nimport pandas as pd\n"
+        + inline((ROOT / "collections_forecast" / "config.py").read_text(encoding="utf-8"))
+        + "\n\n" + "\n\n".join(diagnostic_defs)), nbformat.v4.new_code_cell('''OUTPUT_DIR = "outputs/forecast_rr_fixed_10_10"
+saved_result, saved_config = load_saved_run_diagnostics(OUTPUT_DIR)
+_ = save_run_diagnostics(saved_result, saved_config)
+panels = diagnostic_panels(saved_result, saved_config)
+print("Краткая диагностика сохранена:", Path(OUTPUT_DIR, "diagnostics_summary.txt").resolve())
+'''), nbformat.v4.new_code_cell("print(panels[0])"), nbformat.v4.new_code_cell("print(panels[1])"),
+        nbformat.v4.new_code_cell('print("\\n\\n".join(panels[2:]))')]
+    helper = nbformat.v4.new_notebook(cells=helper_cells, metadata=notebook.metadata)
+    for index, cell in enumerate(helper.cells):
+        cell["id"] = f"diagnostics-{index:02d}"
+    nbformat.validate(helper)
+    diagnostic_path = ROOT / "forecast_diagnostics.ipynb"
+    nbformat.write(helper, diagnostic_path)
+    print(diagnostic_path)
 
 
 if __name__ == "__main__":
