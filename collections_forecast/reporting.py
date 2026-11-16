@@ -58,13 +58,17 @@ def save_report(segment, total, score, config):
     if score["complete"]:
         outcome = "ЦЕЛЬ ДОСТИГНУТА" if score["goal_achieved"] else "ЦЕЛЬ НЕ ДОСТИГНУТА"
     else:
-        outcome = "ОЦЕНКА НЕПОЛНАЯ: отсутствует план, пропущены факты или появились сегменты вне исходной сетки"
+        outcome = ("ОЦЕНКА ПО ДОСТУПНЫМ ДАТАМ" if score["scored_days"] else "НЕТ ДАТ ДЛЯ ОЦЕНКИ")
     failed = total[total.absolute_error_pp.gt(config.tolerance_pp)]
     text = (f"# {config.forecast_month}: {outcome}\n\n"
             f"Допуск: {config.tolerance_pp} п.п. на каждую дату с положительным планом.\n\n"
             f"Максимальная ошибка: {score['max_error_pp']} п.п.\n\n"
             f"Средняя ошибка: {score['mae_pp']} п.п.\n\n"
             f"Доля попаданий: {score['hit_rate']}\n\n"
+            f"Оценено дат: {score['scored_days']}; без оценки: {score['unscored_days']}. "
+            f"Полный месяц оценён: {score['complete']}.\n\n"
+            f"Последняя оценённая дата: {score['last_scored_date']}; "
+            f"ошибка: {score['last_scored_error_pp']} п.п.\n\n"
             f"Даты превышения допуска: {', '.join(failed.date.dt.strftime('%Y-%m-%d')) or 'нет среди оценённых дат'}.\n\n"
             "Денежный вклад сегментов в отклонение и поправки согласования сохранены в comparison_segments.csv. "
             "Календарные группы и сегментные вклады описывают отклонения, но сами по себе не доказывают их причины.\n")

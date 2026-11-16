@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from .config import Config, month_start, origin, days
-from .data import Inputs, PlanUnavailableError, load_raw, prepare_actual, raw_asof, daily_actual, numeric, split_dated_frame
+from .data import Inputs, PlanUnavailableError, load_raw, prepare_actual, raw_asof, daily_actual, evaluation_actual, numeric, split_dated_frame
 from .features import FeatureBuilder
 from .models import ModelHistoryUnavailableError, candidates, reconcile, specs, spec_id
 from .export import upload_frame, database_upload_frame, aggregate_database_upload, legacy_dashboard_upload
@@ -30,8 +30,11 @@ def evaluate(forecast, actual, config):
         raise ValueError("Actual dates fall outside the forecast month")
     if actual.duplicated(keys).any():
         raise ValueError("Actuals must be aggregated to the forecast grain")
-    f = forecast.merge(actual[[*keys, "fact"]], on=keys, how="outer", indicator=True, validate="one_to_one")
-    f["missing_actual"] = f._merge.eq("left_only") | f.fact.isna()
+    snapshots = "fact_cumulative" in actual
+    actual_columns = [*keys, "fact", *(["fact_cumulative"] if snapshots else [])]
+    observed = actual[actual_columns].rename(columns={"fact_cumulative": "_actual_snapshot"})
+    f = forecast.merge(observed, on=keys, how="outer", indicator=True, validate="one_to_one")
+    f["missing_actual"] = f._merge.eq("left_only") | (f._actual_snapshot.isna() if snapshots else f.fact.isna())
     f["unplanned_actual"] = f._merge.eq("right_only")
     # Extra actual segments must contribute to the total, never disappear in an inner join.
     for c in ["plan", "forecast_daily", "reconciliation_daily"]:
@@ -39,17 +42,21 @@ def evaluate(forecast, actual, config):
     f = f.sort_values([*config.segments, "date"]).reset_index(drop=True)
     f["forecast_cumulative"] = f.groupby(list(config.segments)).forecast_daily.cumsum()
     f["plan_cumulative"] = f.groupby(list(config.segments)).plan.transform(lambda s: s.cumsum(skipna=False))
-    f["fact_cumulative"] = f.groupby(list(config.segments)).fact.transform(lambda s: s.cumsum(skipna=False))
+    f["fact_cumulative"] = (f._actual_snapshot if snapshots else
+        f.groupby(list(config.segments)).fact.transform(lambda s: s.cumsum(skipna=False)))
     f["signed_error_daily"] = f.forecast_daily - f.fact
     f["signed_error_cumulative"] = f.forecast_cumulative.fillna(0) - f.fact_cumulative
     total = f.groupby("date", as_index=False).agg(
         plan_daily=("plan", lambda s: s.sum(skipna=False)), forecast_daily=("forecast_daily", "sum"),
         missing_plan_cells=("plan_missing", "sum"),
-        observed_fact_daily=("fact", lambda s: s.sum(min_count=1)),
+        observed_fact_daily=("fact", lambda s: s.sum(skipna=False)),
         missing_actual_cells=("missing_actual", "sum"), unplanned_actual_cells=("unplanned_actual", "sum"))
     total["fact_daily"] = total.observed_fact_daily.where(total.missing_actual_cells.eq(0))
     for c in ["plan", "forecast", "fact"]:
         total[f"{c}_cumulative"] = total[f"{c}_daily"].cumsum(skipna=False)
+    if snapshots:
+        amounts = f.groupby("date").fact_cumulative.agg(lambda s: s.sum(skipna=False))
+        total["fact_cumulative"] = total.date.map(amounts).where(total.missing_actual_cells.eq(0))
     denominator = total.plan_cumulative.where(total.plan_cumulative.gt(0))
     total["actual_efficiency_pct"] = 100 * total.fact_cumulative / denominator
     total["forecast_efficiency_pct"] = 100 * total.forecast_cumulative / denominator
@@ -58,7 +65,7 @@ def evaluate(forecast, actual, config):
     total["within_tolerance"] = total.absolute_error_pp.le(config.tolerance_pp) & total.absolute_error_pp.notna()
     total["signed_error_money"] = total.forecast_cumulative - total.fact_cumulative
     total["month"] = total.date.dt.strftime("%Y-%m")
-    return f.drop(columns="_merge"), total
+    return f.drop(columns=["_merge", "_actual_snapshot"], errors="ignore"), total
 
 
 def metrics(total, config):
@@ -75,7 +82,11 @@ def metrics(total, config):
         "p90_error_pp": float(errors.quantile(0.9)) if len(errors) else None,
         "bias_pp": float(total.loc[valid, "signed_error_pp"].mean()) if len(errors) else None,
         "end_error_pp": float(total.absolute_error_pp.iloc[-1]) if len(total) and pd.notna(total.absolute_error_pp.iloc[-1]) else None,
-        "hit_rate": float(total.loc[eligible, "within_tolerance"].mean()) if eligible.any() else None,
+        "hit_rate": float(total.loc[valid, "within_tolerance"].mean()) if valid.any() else None,
+        "last_scored_date": total.loc[valid, "date"].iloc[-1].strftime("%Y-%m-%d") if valid.any() else None,
+        "last_scored_error_pp": float(errors.iloc[-1]) if len(errors) else None,
+        "unscored_days": int(len(total) - valid.sum()),
+        "available_days_goal_achieved": bool(valid.any() and errors.le(config.tolerance_pp).all()),
         "eligible_days": int(eligible.sum()), "scored_days": int(valid.sum()),
         "missing_actual_cells": int(total.missing_actual_cells.sum()),
         "unplanned_actual_cells": int(total.unplanned_actual_cells.sum()),
@@ -454,8 +465,7 @@ class ForecastRunner:
         else:
             actual_raw = load_raw(self.config, month=self.config.forecast_month)
         # Evaluation uses the latest available actual revision, not a fictitious pre-month snapshot.
-        actual_raw = raw_asof(actual_raw, self.config, pd.Timestamp.max - pd.Timedelta(days=1))
-        segment, total = evaluate(pred, daily_actual(actual_raw, self.config), self.config)
+        segment, total = evaluate(pred, evaluation_actual(actual_raw, self.config), self.config)
         score = metrics(total, self.config)
         if save:
             from .reporting import save_report

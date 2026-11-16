@@ -137,6 +137,49 @@ result["dashboard_upload"].to_csv(dashboard_csv, index=False, encoding="utf-8-si
 print("Файл для СТАРОГО загрузчика:", dashboard_csv.resolve())
 print("Одна строка на дату. fact/plan — накопленные суммы. dt_in и forecast_date — первое число месяца.")
 print("Поместите этот CSV рядом с upload_model_effect.py. Его чтение долга и загрузку в БД оставьте прежними.")
+'''), nbformat.v4.new_markdown_cell('''## Отклонение от факт/план, п.п. — по доступным датам
+
+Эту ячейку можно запускать повторно после обновления фактов в `df`: используется готовый
+`result["forecast"]`, модель не переобучается. Выгрузка по ТБ и бакетам не требуется.
+Для накопленных RR-снимков известная дата после пропуска тоже оценивается.
+Разница = `100 × (прогноз − факт) / план`: плюс — завышение прогноза, минус — занижение.
+Пропущенные даты не входят в среднюю ошибку и долю попаданий. Итог относится к доступным датам,
+а подтверждение точности за полный месяц требует полного факта и плана.
+'''), nbformat.v4.new_code_cell('''_, _, actual_for_pp = split_dated_frame(df, config.resolved())
+if actual_for_pp.empty:
+    print("В df нет факта целевого месяца для сравнения.")
+else:
+    actual_for_pp = prepare_actual(actual_for_pp, config, month=config.forecast_month)
+    segment_pp, comparison_pp = evaluate(
+        result["forecast"], evaluation_actual(actual_for_pp, config), config)
+    score_pp = metrics(comparison_pp, config)
+    result["comparison"], result["metrics"] = comparison_pp, score_pp
+    result["segment_comparison"] = segment_pp
+    valid_pp = comparison_pp.absolute_error_pp.notna()
+    pp_table = comparison_pp.loc[valid_pp, [
+        "date", "actual_efficiency_pct", "forecast_efficiency_pct",
+        "signed_error_pp", "absolute_error_pp", "within_tolerance",
+    ]].rename(columns={
+        "date": "Дата", "actual_efficiency_pct": "Факт/план, %",
+        "forecast_efficiency_pct": "Прогноз/план, %", "signed_error_pp": "Отклонение, п.п.",
+        "absolute_error_pp": "Абс. отклонение, п.п.", "within_tolerance": "В пределах допуска",
+    })
+    display(pp_table)
+    print(f"Оценено дат: {score_pp['scored_days']} из {len(comparison_pp)}; без оценки: {score_pp['unscored_days']}")
+    display(pd.Series({
+        "Максимальная ошибка, п.п.": score_pp["max_error_pp"],
+        "Средняя абсолютная ошибка, п.п.": score_pp["mae_pp"],
+        "Среднее смещение, п.п.": score_pp["bias_pp"],
+        "Доля попаданий среди оценённых дат": score_pp["hit_rate"],
+        "Последняя оценённая дата": score_pp["last_scored_date"],
+        "Ошибка на последнюю оценённую дату, п.п.": score_pp["last_scored_error_pp"],
+        "Допуск соблюдён на доступных датах": score_pp["available_days_goal_achieved"],
+        "Полный месяц оценён": score_pp["complete"],
+    }, name="Оценка"))
+    evaluation_dir = Path(config.output_dir)
+    evaluation_dir.mkdir(parents=True, exist_ok=True)
+    pp_table.to_csv(evaluation_dir / "comparison_available_pp.csv", index=False, encoding="utf-8-sig")
+    save_report(segment_pp, comparison_pp, score_pp, config)
 '''), nbformat.v4.new_markdown_cell('''## CSV с фильтрами продукта, DPD, PVR, ТБ и входов
 
 Подготовьте `df_layout`: полный **известный на момент прогноза** план целевого месяца по строкам

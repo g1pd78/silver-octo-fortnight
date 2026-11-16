@@ -290,6 +290,33 @@ def daily_actual(raw, config):
     return raw.groupby(["date", *config.segments], as_index=False, dropna=False).agg(**aggregates)
 
 
+def evaluation_actual(raw, config):
+    """Use observed cumulative snapshots directly, including after missing dates.
+
+    This is evaluation only. Training still requires contiguous cohort history.
+    A change spanning a gap is not reported as a one-day collection.
+    """
+    if config.fact_mode != "cumulative":
+        return daily_actual(raw, config)
+    f = raw.copy()
+    dims = list(config.segments)
+    if config.raw_available_column:
+        key = ["report_month", "date", "dt_in", *dims]
+        f = f.sort_values("available_at").drop_duplicates(key, keep="last")
+    if config.forecast_grain == "total":
+        f = portfolio_totals(f, config)
+    source = "_source_fact" if "_source_fact" in f else "fact"
+    result = f.groupby(["date", *dims], as_index=False).agg(
+        fact_cumulative=(source, lambda s: s.sum(skipna=False)))
+    result["fact"] = np.nan
+    for _, group in result.groupby(dims, sort=False):
+        grid = group.set_index("date").fact_cumulative.reindex(days(config.forecast_month))
+        change = grid.diff()
+        change.iloc[0] = grid.iloc[0]
+        result.loc[group.index, "fact"] = change.reindex(group.date).to_numpy()
+    return result.sort_values([*dims, "date"]).reset_index(drop=True)
+
+
 def load_plan(config, month, allow_missing=False):
     """Read target only: target-month fact/debt columns are never selected."""
     table_name = config.plan_table or config.raw_table

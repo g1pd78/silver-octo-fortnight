@@ -52,6 +52,7 @@ print('Standalone notebook execution, aggregate and filtered CSVs passed')
     # a missing historical plan, not just the installed package or demo defaults.
     real_sources = [cell.source.replace('forecast_month="2026-11"', 'forecast_month="2026-09"')
                     for cell in notebook.cells if cell.cell_type == "code"]
+    evaluation_cell = next(source for source in real_sources if source.startswith("_, _, actual_for_pp"))
     with tempfile.TemporaryDirectory() as directory:
         script = Path(directory) / "missing_plan_check.py"
         script.write_text("""import importlib.util
@@ -78,6 +79,16 @@ assert uploaded.fact.iloc[-1] < 4000  # no second cumulative sum
 assert np.isfinite(result['forecast'].forecast_efficiency_pct).all()
 assert (Path(config.output_dir) / 'forecast_run_status.json').exists()
 print('Non-demo cumulative RR notebook with missing historical plan passed')
+before_evaluation = result['forecast'].copy(deep=True)
+df.loc[df.date.between('2026-09-12', '2026-09-17'), 'fact'] = np.nan
+""" + evaluation_cell + """
+assert result['metrics']['scored_days'] == 24
+assert result['metrics']['unscored_days'] == 6
+assert result['metrics']['last_scored_date'] == '2026-09-30'
+assert not result['metrics']['complete']
+pd.testing.assert_frame_equal(before_evaluation, result['forecast'])
+assert len(pd.read_csv(Path(config.output_dir) / 'comparison_available_pp.csv')) == 24
+print('Separate evaluation cell: six missing dates, 24 scored dates, unchanged forecast passed')
 """, encoding="utf-8")
         subprocess.run([sys.executable, "-I", str(script)], cwd=directory, check=True)
 
