@@ -224,13 +224,28 @@ class ForecastRunner:
         if len(absent):
             reasons.append(f"В плане нет {len(absent)} сегментов, присутствовавших в недавней истории.")
         historical_issues = self.historical_plan_issues() if not reasons else (self._historical_plan_issues or [])
+        coverage = {}
+        for phase in ["development", "control"]:
+            expected = [str(m) for m in pd.period_range(getattr(self.config, f"{phase}_start"),
+                                                        getattr(self.config, f"{phase}_end"), freq="M")]
+            excluded = {i["month"] for i in historical_issues if i["phase"] == phase}
+            coverage[phase] = {"expected_months": expected, "excluded_months": sorted(excluded),
+                               "available_months": ([m for m in expected if m not in excluded]
+                                                    if self._historical_plan_issues is not None else None)}
         if historical_issues:
             months = ", ".join(sorted({entry["month"] for entry in historical_issues}))
-            reasons.append(f"Недоступен план исторической проверки: {months}. Денежный прогноз строится по истории сборов; подбор и контроль моделей не выполнены.")
+            if (self.config.allow_missing_plan_folds and
+                    all(part["available_months"] for part in coverage.values())):
+                warnings.append(f"Из исторической проверки исключены месяцы без плана: {months}. "
+                                "Подбор и контроль выполняются на остальных месяцах; исключённые месяцы не оценены.")
+            else:
+                reasons.append(f"Недоступен план исторической проверки: {months}. "
+                               "Не осталось месяцев для одного из этапов или включён строгий режим; используется резервный прогноз.")
         reasons.extend(f"Недостаточно истории для модели ({i['phase']}, {i['month']}): {i['reason']}"
                        for i in self._model_fallback_issues)
         return {"mode": "money_fallback" if reasons else "selected_model", "reasons": reasons,
                 "warnings": warnings, "model_plan_estimated_cells": estimated_cells,
+                "validation_coverage": coverage,
                 "historical_plan_issues": historical_issues,
                 "model_history_issues": list(self._model_fallback_issues),
                 "forecast_grain": self.config.forecast_grain,
@@ -238,7 +253,7 @@ class ForecastRunner:
                 "missing_plan_dates": plan.loc[plan.plan.isna(), "date"].drop_duplicates().dt.strftime("%Y-%m-%d").tolist(),
                 "missing_segment_examples": absent.head(10).to_dict("records"),
                 "plan_is_forecast": self.config.plan_is_forecast,
-                "validation": "not_run" if reasons else "model_selection_and_control"}
+                "validation": "not_run" if reasons else ("partial_model_selection_and_control" if historical_issues else "model_selection_and_control")}
 
     def _predict_candidates(self, month):
         result = candidates(self.history, month, self.config, self.builder)
@@ -297,7 +312,11 @@ class ForecastRunner:
         c = self.config
         rows, curves, specifications = [], [], {}
         expected_months = [str(m) for m in pd.period_range(c.development_start, c.development_end, freq="M")]
+        excluded = {i["month"] for i in self.historical_plan_issues() if i["phase"] == "development"}
         for month in expected_months:
+            if month in excluded:
+                print(f"Development {month}: excluded (official plan unavailable)")
+                continue
             try:
                 x, leaves, totals = self._predict_candidates(month)
                 truth = self._truth(month)
@@ -353,8 +372,12 @@ class ForecastRunner:
             raise ValueError("Run select() first, or load a previously frozen selection")
         c = self.config
         rows, curves = [], []
+        excluded = {i["month"] for i in self.historical_plan_issues() if i["phase"] == "control"}
         for m in pd.period_range(c.control_start, c.control_end, freq="M"):
             month = str(m)
+            if month in excluded:
+                print(f"Control {month}: excluded (official plan unavailable)")
+                continue
             try:
                 x, leaves, totals = self._predict_candidates(month)
             except (PlanUnavailableError, ModelHistoryUnavailableError) as exc:
@@ -542,7 +565,7 @@ def _run(df, plan_df=None, actual_df=None, *, config=None, forecast_month=None,
     segment_comparison = comparison = score = None
     if actual_df is not None and not actual_df.empty:
         segment_comparison, comparison, score = runner.compare(actual_df=actual_df, save=save)
-    return {
+    result = {
         "forecast": forecast, "upload": database_upload_frame(forecast, config),
         "upload_total": aggregate_database_upload(database_upload_frame(forecast, config)),
         "dashboard_upload": legacy_dashboard_upload(database_upload_frame(forecast, config)),
@@ -551,6 +574,10 @@ def _run(df, plan_df=None, actual_df=None, *, config=None, forecast_month=None,
         "metrics": score, "ranking": ranking, "control": control, "selection": selection,
         "audit": audit, "history_months": history_months, "report_checks": report_checks,
     }
+    if save:
+        from .reporting import save_run_diagnostics
+        save_run_diagnostics(result, config)
+    return result
 
 
 def run(df, plan_df=None, actual_df=None, *, config=None, forecast_month=None,

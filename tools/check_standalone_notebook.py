@@ -65,7 +65,7 @@ def display(value):
     pass
 dates = pd.date_range('2024-01-01', '2026-09-30')
 df = pd.DataFrame({'date': dates, 'fact': dates.day * 90., 'plan': dates.day * 100.})
-df.loc[df.date.dt.strftime('%Y-%m').eq('2026-01'), 'plan'] = np.nan
+df.loc[df.date.between('2025-12-01', '2026-05-31'), 'plan'] = np.nan
 """ + "\n\n".join(real_sources) + """
 assert result['plan_status']['mode'] == 'money_fallback'
 assert result['ranking'].empty and result['control'].empty
@@ -88,8 +88,10 @@ assert result['metrics']['last_scored_date'] == '2026-09-30'
 assert not result['metrics']['complete']
 pd.testing.assert_frame_equal(before_evaluation, result['forecast'])
 assert len(pd.read_csv(Path(config.output_dir) / 'comparison_available_pp.csv')) == 24
+diagnostic = (Path(config.output_dir) / 'diagnostics.txt').read_text(encoding='utf-8')
+assert '"scored_days": 24' in diagnostic and '"unscored_days": 6' in diagnostic
 print('Separate evaluation cell: six missing dates, 24 scored dates, unchanged forecast passed')
-df.loc[df.date.dt.strftime('%Y-%m').eq('2026-01'), 'plan'] = df.loc[df.date.dt.strftime('%Y-%m').eq('2026-01'), 'date'].dt.day * 100.
+df.loc[df.date.lt('2026-09-01'), 'plan'] = df.loc[df.date.lt('2026-09-01'), 'date'].dt.day * 100.
 df.loc[df.date.ge('2026-09-25'), 'plan'] = np.nan
 partial_config = replace(config, output_dir='outputs/partial_plan_check',
                          development_start='2026-01', development_end='2026-01',
@@ -103,6 +105,20 @@ assert partial_result['dashboard_upload'].plan.iloc[24:].isna().all()
 assert partial_result['forecast'].model_plan.notna().all()
 assert (Path(partial_config.output_dir) / 'model_plan_estimates.csv').exists()
 print('Partial plan tail: fitted models retained, official NULLs preserved passed')
+dates = pd.date_range('2024-01-01', '2026-10-31')
+day = dates.day.to_numpy()
+df = pd.DataFrame({'date': dates, 'plan': day * 100., 'fact': day * 100. * (1.01 + .2*np.exp(-(day-1)/2.5))})
+df.loc[df.date.dt.strftime('%Y-%m').eq('2026-08') | df.date.ge('2026-10-26'), 'plan'] = np.nan
+config = replace(partial_config, forecast_month='2026-10', control_start='2026-07', control_end='2026-09',
+                 output_dir='outputs/august_excluded')
+result = run(df, config=config)
+assert result['plan_status']['mode'] == 'selected_model'
+assert result['plan_status']['validation'] == 'partial_model_selection_and_control'
+assert result['control'].month.tolist() == ['2026-07', '2026-09']
+assert result['metrics']['max_error_pp'] < 1e-6
+assert result['forecast'].forecast_efficiency_pct.iloc[0] > 120
+assert '2026-08' in (Path(config.output_dir) / 'diagnostics.txt').read_text(encoding='utf-8')
+print('Missing August: fitted selection retained, daily execution shape and automatic diagnostics passed')
 """, encoding="utf-8")
         subprocess.run([sys.executable, "-I", str(script)], cwd=directory, check=True)
 

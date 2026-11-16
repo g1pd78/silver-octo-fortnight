@@ -92,8 +92,9 @@ pvr_bucket, terbank, inflow`. История содержит `fact` или `w1,
 для визуального сравнения RR и не поступает в обучение или оценку до начала месяца.
 Нельзя присоединять прогноз к сырым строкам RR по дате или восстанавливать `dt_in` через JOIN: это размножит суммы.
 Пустые `ranking/control` означают резервный режим: причины перечислены в `result["plan_status"]`.
-Отсутствие плана в исторических месяцах development/control также включает резервный денежный прогноз,
-а не останавливает запуск. Непроверенные месяцы перечислены в `historical_plan_issues` и `fold_log.csv`.
+Месяцы development/control без плана исключаются из проверки, если остаются месяцы для обоих этапов
+(`allow_missing_plan_folds=True`). Покрытие видно в `validation_coverage`, статус — `partial_model_selection_and_control`.
+Если для этапа не осталось месяцев, включается резервный прогноз. Непроверенные месяцы перечислены в `historical_plan_issues` и `fold_log.csv`.
 Известный план целевого месяца сохраняется в CSV; неизвестный остаётся NULL. Точность 1 п.п. в этом режиме не подтверждена.
 При нехватке обучающих/референсных месяцев денежный прогноз также сохраняется; подробности — в `model_history_issues`.
 Если отсутствует только хвост плана после известных дней, `estimate_plan_tail=True` сохраняет подбор моделей:
@@ -101,6 +102,8 @@ pvr_bucket, terbank, inflow`. История содержит `fact` или `w1,
 В CSV для БД этот план остаётся NULL; модельные оценки сохраняются отдельно в `model_plan_estimates.csv`.
 Количество оценённых ячеек — `model_plan_estimated_cells`, ограничения — `warnings` в `plan_status`.
 В подборе участвуют также `plan_baseline` (прогноз = план) и `plan_execution` (план × историческое выполнение).
+`plan_execution_curve` переносит историческое выполнение отдельно по дням месяца, сохраняя начальный всплеск;
+`plan_execution_blend` смешивает этот профиль с постоянным коэффициентом. Выбор делается по прошлым месяцам.
 Если историческая проверка недоступна, резервный `fallback_plan_execution` использует известный/модельный план
 и историческое выполнение, когда эти данные доступны. Это не подтверждённый на контроле выбор модели.
 При ошибке входа полный текст сохраняется в `input_error.txt` в каталоге результатов.
@@ -128,6 +131,7 @@ else:
         fact_mode="cumulative",    # RR: w1 - w2 - cession - write_off — сбор НА ДАТУ
         plan_mode="cumulative",    # RR: target — план НА ДАТУ
         estimate_plan_tail=True,   # недостающий хвост — оценка только для модели, не официальный план
+        allow_missing_plan_folds=True,  # пропуск плана одного исторического месяца не отключает весь подбор
         output_dir="outputs/forecast_rr_fixed",
     )
     # df = ваш_коннектор(...)  # date, fact, plan; включая известный будущий план
@@ -145,6 +149,12 @@ result["dashboard_upload"].to_csv(dashboard_csv, index=False, encoding="utf-8-si
 print("Файл для СТАРОГО загрузчика:", dashboard_csv.resolve())
 print("Одна строка на дату. fact/plan — накопленные суммы. dt_in и forecast_date — первое число месяца.")
 print("Поместите этот CSV рядом с upload_model_effect.py. Его чтение долга и загрузку в БД оставьте прежними.")
+'''), nbformat.v4.new_markdown_cell('''## Диагностика запуска
+
+Вывод ниже содержит режим, модели, причины перехода в резерв, исключённые месяцы,
+метрики и десять худших дат. Он также записывается в `output_dir/diagnostics.txt`.
+Этот файл можно прислать целиком для проверки — вручную набирать команды не нужно.
+'''), nbformat.v4.new_code_cell('''print(save_run_diagnostics(result, config))
 '''), nbformat.v4.new_markdown_cell('''## Отклонение от факт/план, п.п. — по доступным датам
 
 Эту ячейку можно запускать повторно после обновления фактов в `df`: используется готовый
@@ -188,6 +198,7 @@ else:
     evaluation_dir.mkdir(parents=True, exist_ok=True)
     pp_table.to_csv(evaluation_dir / "comparison_available_pp.csv", index=False, encoding="utf-8-sig")
     save_report(segment_pp, comparison_pp, score_pp, config)
+    print(save_run_diagnostics(result, config))
 '''), nbformat.v4.new_markdown_cell('''## CSV с фильтрами продукта, DPD, PVR, ТБ и входов
 
 Подготовьте `df_layout`: полный **известный на момент прогноза** план целевого месяца по строкам

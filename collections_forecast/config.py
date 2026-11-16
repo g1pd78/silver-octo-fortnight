@@ -42,6 +42,7 @@ class Config:
     require_all_folds: bool = True
     require_calendar_overrides: bool = False
     estimate_plan_tail: bool = True  # model features only; official unknown plans stay NULL
+    allow_missing_plan_folds: bool = True  # exclude unavailable plans, report reduced validation coverage
 
     def resolved(self):
         if self.forecast_month is None:

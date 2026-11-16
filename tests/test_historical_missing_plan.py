@@ -148,6 +148,7 @@ class HistoricalMissingPlanTests(unittest.TestCase):
             with self.subTest(target=target):
                 c = replace(self.c, forecast_month=target, development_start=None, development_end=None,
                             control_start=None, control_end=None).resolved()
+                c = replace(c, development_end=c.development_start)
                 dates = pd.date_range("2023-01-01", pd.Period(target).end_time.normalize())
                 frame = pd.DataFrame({"date": dates, "fact": dates.day * 90., "plan": dates.day * 100.})
                 frame = frame[frame.date.dt.strftime("%Y-%m").ne(c.development_start)]

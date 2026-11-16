@@ -1,7 +1,42 @@
 from pathlib import Path
+import json
 import numpy as np
 import pandas as pd
 from .pipeline import json_write
+
+
+def save_run_diagnostics(result, config):
+    """One support log for the finished run; refresh after evaluating new actuals."""
+    forecast = result.get("forecast")
+    models = sorted(forecast.model.dropna().astype(str).unique().tolist()) if forecast is not None and "model" in forecast else []
+    c = config.resolved()
+    settings = {name: getattr(c, name) for name in [
+        "forecast_month", "fact_mode", "plan_mode", "forecast_grain", "reference_months", "min_train_months",
+        "development_start", "development_end", "control_start", "control_end", "enable_catboost",
+        "enable_sarimax", "estimate_plan_tail", "allow_missing_plan_folds", "output_dir"]}
+    def dump(value):
+        return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+    lines = ["ДИАГНОСТИКА ПРОГНОЗА · partial-validation-v1", "Настройки:", dump(settings),
+             "Фактически использованные модели:", dump(models),
+             "Выбранная комбинация:", dump(result.get("selection")),
+             "Режим, причины, предупреждения и покрытие исторической проверки:", dump(result.get("plan_status")),
+             "Метрики сравнения с фактом:", dump(result.get("metrics"))]
+    comparison = result.get("comparison")
+    if comparison is not None and not comparison.empty:
+        eligible = comparison.absolute_error_pp.notna()
+        columns = ["date", "plan_cumulative", "actual_efficiency_pct", "forecast_efficiency_pct",
+                   "signed_error_pp", "absolute_error_pp"]
+        worst = comparison.loc[eligible].nlargest(10, "absolute_error_pp")[columns].copy()
+        worst["date"] = pd.to_datetime(worst.date).dt.strftime("%Y-%m-%d")
+        lines += ["Десять худших оценённых дат:", worst.to_string(index=False, float_format=lambda v: f"{v:.6f}"),
+                  "Даты без оценки:", ", ".join(pd.to_datetime(comparison.loc[~eligible, "date"]).dt.strftime("%Y-%m-%d")) or "нет"]
+    else:
+        lines.append("Сравнения с фактом нет: передайте фактические снимки целевого месяца в df.")
+    text = "\n".join(lines) + "\n"
+    out = Path(c.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "diagnostics.txt").write_text(text, encoding="utf-8")
+    return text
 
 
 def save_forecast_chart(total, config, path):

@@ -132,7 +132,7 @@ def calendar_design(frame):
     return np.column_stack(columns)
 
 
-def plan_execution_forecast(history, features, config):
+def plan_execution_forecast(history, features, config, daily_profile=False):
     """Known/model plan times recent completed months' execution, never target actuals."""
     dims = list(config.segments)
     month = features.date.iloc[0].strftime("%Y-%m")
@@ -140,6 +140,7 @@ def plan_execution_forecast(history, features, config):
 
     def rate(part):
         ratios = []
+        profiles = []
         for previous, rows in part.groupby(part.date.dt.to_period("M"), sort=True):
             rows = rows.groupby("date", as_index=False)[["fact", "raw_plan"]].agg(lambda s: s.sum(skipna=False))
             rows = rows.sort_values("date")
@@ -149,7 +150,20 @@ def plan_execution_forecast(history, features, config):
             value = rows.fact.sum() / rows.raw_plan.sum()
             if np.isfinite(value) and value >= 0:
                 ratios.append(value)
-        return float(np.median(ratios[-config.reference_months:])) if ratios else None
+                if daily_profile:
+                    cumulative_plan = rows.raw_plan.cumsum()
+                    curve = (rows.fact.cumsum() / cumulative_plan.where(cumulative_plan.gt(0))).to_numpy()
+                    # Match calendar day numbers: do not stretch the first-day spike
+                    # when February has 28 days and the target month has 31.
+                    profiles.append(np.r_[curve, np.repeat(curve[-1], 31 - len(curve))])
+        if not ratios:
+            return None
+        level = float(np.median(ratios[-config.reference_months:]))
+        if not daily_profile:
+            return level
+        sample = np.asarray(profiles[-config.reference_months:])
+        return np.array([np.median(column[np.isfinite(column)]) if np.isfinite(column).any() else level
+                         for column in sample.T])
 
     global_rate = rate(h)
     if global_rate is None:
@@ -161,7 +175,10 @@ def plan_execution_forecast(history, features, config):
         for dim, value in zip(dims, values):
             part = part[part[dim].eq(value)]
         local_rate = rate(part)
-        prediction.loc[group.index] = group.plan_cumulative * (global_rate if local_rate is None else local_rate)
+        coefficient = global_rate if local_rate is None else local_rate
+        if daily_profile:
+            coefficient = coefficient[group.date.dt.day.to_numpy() - 1]
+        prediction.loc[group.index] = group.plan_cumulative * coefficient
     return prediction.to_numpy()
 
 
@@ -196,6 +213,8 @@ def candidates(history, month, config, builder):
     leaves["calendar_profile"] = profile_forecast(history, x, config, calendar=True, builder=builder)
     leaves["plan_baseline"] = x.plan_cumulative.to_numpy()
     leaves["plan_execution"] = plan_execution_forecast(history, x, config)
+    leaves["plan_execution_curve"] = plan_execution_forecast(history, x, config, daily_profile=True)
+    leaves["plan_execution_blend"] = (leaves["plan_execution"] + leaves["plan_execution_curve"]) / 2
     if builder.inputs.reference is not None:
         ext = builder.inputs.vintage(builder.inputs.reference, month, ["forecast_daily"], ["date"])
         joined = x[["date", *config.segments]].merge(ext, on=["date", *config.segments], how="left", validate="one_to_one")
