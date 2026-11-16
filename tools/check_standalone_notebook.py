@@ -89,6 +89,20 @@ assert not result['metrics']['complete']
 pd.testing.assert_frame_equal(before_evaluation, result['forecast'])
 assert len(pd.read_csv(Path(config.output_dir) / 'comparison_available_pp.csv')) == 24
 print('Separate evaluation cell: six missing dates, 24 scored dates, unchanged forecast passed')
+df.loc[df.date.dt.strftime('%Y-%m').eq('2026-01'), 'plan'] = df.loc[df.date.dt.strftime('%Y-%m').eq('2026-01'), 'date'].dt.day * 100.
+df.loc[df.date.ge('2026-09-25'), 'plan'] = np.nan
+partial_config = replace(config, output_dir='outputs/partial_plan_check',
+                         development_start='2026-01', development_end='2026-01',
+                         control_start='2026-08', control_end='2026-08',
+                         min_train_months=2, enable_catboost=False, enable_sarimax=False)
+partial_result = run(df, config=partial_config)
+assert partial_result['plan_status']['mode'] == 'selected_model'
+assert partial_result['plan_status']['model_plan_estimated_cells'] == 6
+assert not partial_result['ranking'].empty and not partial_result['control'].empty
+assert partial_result['dashboard_upload'].plan.iloc[24:].isna().all()
+assert partial_result['forecast'].model_plan.notna().all()
+assert (Path(partial_config.output_dir) / 'model_plan_estimates.csv').exists()
+print('Partial plan tail: fitted models retained, official NULLs preserved passed')
 """, encoding="utf-8")
         subprocess.run([sys.executable, "-I", str(script)], cwd=directory, check=True)
 

@@ -41,6 +41,7 @@ class Config:
     country: str = "RU"
     require_all_folds: bool = True
     require_calendar_overrides: bool = False
+    estimate_plan_tail: bool = True  # model features only; official unknown plans stay NULL
 
     def resolved(self):
         if self.forecast_month is None:

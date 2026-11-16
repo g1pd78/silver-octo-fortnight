@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 from .config import month_start, origin, days
 from .data import PlanUnavailableError, raw_asof, numeric
+from .plan_completion import complete_plan_tail
 
 
 # Russian production-calendar transfers for the historical forecast window.
@@ -39,6 +40,18 @@ class FeatureBuilder:
         self.config, self.inputs = config, inputs
         self._calendar_cache = {}
         self._feature_cache = {}
+        self._model_plan_cache = {}
+
+    def model_plan(self, history, month):
+        key = (id(history), str(month))
+        if key not in self._model_plan_cache:
+            plan = self.inputs.plan(month)
+            if str(month) == self.config.forecast_month and self.config.estimate_plan_tail:
+                plan = complete_plan_tail(history, plan, self.config, str(month))
+            else:
+                plan["plan_estimated"] = False
+            self._model_plan_cache[key] = plan
+        return self._model_plan_cache[key].copy()
 
     def calendar(self, month):
         month = str(month)
@@ -151,7 +164,7 @@ class FeatureBuilder:
             return self._feature_cache[cache_key].copy()
         dims = list(self.config.segments)
         h = raw_asof(history, self.config, origin(month))
-        f = self.inputs.plan(month)
+        f = self.model_plan(history, month).drop(columns="plan_estimated")
         f = f.merge(self.calendar(month), on="date", validate="many_to_one")
         f = f.sort_values([*dims, "date"]).reset_index(drop=True)
         f["plan_cumulative"] = f.groupby(dims).plan.cumsum()

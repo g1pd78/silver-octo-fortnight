@@ -3,9 +3,10 @@ import numpy as np
 import pandas as pd
 from .config import days, origin
 from .data import raw_asof, daily_actual
+from .models import ModelHistoryUnavailableError, plan_execution_forecast
 
 
-def money_forecast(history, plan, config):
+def money_forecast(history, plan, config, model_plan=None):
     dims = list(config.segments)
     h = daily_actual(raw_asof(history, config, origin(config.forecast_month)), config)
     dates = days(config.forecast_month)
@@ -43,11 +44,31 @@ def money_forecast(history, plan, config):
             # provisional money estimate, explicitly labelled as cold start.
             daily = official.fillna(official.mean()).fillna(0).to_numpy()
             cumulative, method = np.cumsum(daily), "cold_start_plan_or_zero"
+        model_cumulative = None
+        if model_plan is not None:
+            available = model_plan
+            for dim, value in zip(dims, values):
+                available = available[available[dim].eq(value)]
+            available = available.sort_values("date").copy()
+            if (pd.DatetimeIndex(available.date).equals(dates) and available.plan.notna().all()
+                    and available.plan.sum() > 0):
+                available["plan_cumulative"] = available.plan.cumsum()
+                try:
+                    estimate = plan_execution_forecast(history, available, config)
+                except ModelHistoryUnavailableError:
+                    pass
+                else:
+                    cumulative, method = estimate, "plan_execution"
+                    model_cumulative = available.plan_cumulative.to_numpy()
         part = pd.DataFrame({"date": dates, **dict(zip(dims, values)), "plan": official.to_numpy(),
                              "forecast_cumulative": cumulative, "forecast_daily": np.diff(np.r_[0., cumulative])})
         part["plan_cumulative"] = part.plan.cumsum(skipna=False)
         part["plan_month"] = part.plan.sum(skipna=False)
         part["plan_missing"] = part.plan.isna()
+        if model_cumulative is not None:
+            part["model_plan"] = np.diff(np.r_[0., model_cumulative])
+            part["model_plan_cumulative"] = model_cumulative
+            part["plan_estimated"] = official.isna().to_numpy()
         part["base_forecast_cumulative"] = cumulative
         part["reconciliation_cumulative"] = part["reconciliation_daily"] = 0.0
         part["debt"] = 0.0

@@ -157,8 +157,8 @@ class ForecastRunner:
             except PlanUnavailableError as exc:
                 self._activate_money_fallback(c.forecast_month, "forecast_inputs", exc)
         status = self.target_plan_status()
-        report["missing_future_plan_fallback"] = bool(status["missing_plan_cells"] or status["missing_segments"]
-                                                      or not len(self.inputs.plan(c.forecast_month)))
+        report["missing_future_plan_fallback"] = bool(status["mode"] == "money_fallback" and
+            (status["missing_plan_cells"] or status["missing_segments"] or not len(self.inputs.plan(c.forecast_month))))
         report["money_fallback"] = status["mode"] == "money_fallback"
         report["validation"] = status["validation"]
         return report, pd.DataFrame(rows), daily
@@ -195,11 +195,25 @@ class ForecastRunner:
     def target_plan_status(self):
         plan = self.inputs.plan(self.config.forecast_month)
         reasons = []
+        warnings = []
+        estimated_cells = 0
         if plan.empty:
             reasons.append("Нет строк плана целевого месяца из выбранного источника.")
         missing_cells = int(plan.plan.isna().sum())
         if missing_cells:
-            reasons.append(f"Неизвестен дневной план в {missing_cells} ячейках дата × сегмент.")
+            if self.config.estimate_plan_tail:
+                try:
+                    model_plan = self.builder.model_plan(self.history, self.config.forecast_month)
+                    if not model_plan.plan.isna().any():
+                        estimated_cells = int(model_plan.plan_estimated.sum())
+                except PlanUnavailableError:
+                    pass
+            if estimated_cells:
+                warnings.append(f"Хвост плана оценён по истории только для модели: {estimated_cells} ячеек. "
+                                "Официальный план остаётся неизвестным; KPI на эти даты не считается. "
+                                "Исторический контроль использует полные планы и не подтверждает точность оценённого хвоста.")
+            else:
+                reasons.append(f"Неизвестен дневной план в {missing_cells} ячейках дата × сегмент.")
         if not plan.empty and not missing_cells and plan.plan.sum() <= 0:
             reasons.append("Суммарный план равен нулю; эффективность относительно плана не определена.")
         h = raw_asof(self.history, self.config, origin(self.config.forecast_month))
@@ -216,6 +230,7 @@ class ForecastRunner:
         reasons.extend(f"Недостаточно истории для модели ({i['phase']}, {i['month']}): {i['reason']}"
                        for i in self._model_fallback_issues)
         return {"mode": "money_fallback" if reasons else "selected_model", "reasons": reasons,
+                "warnings": warnings, "model_plan_estimated_cells": estimated_cells,
                 "historical_plan_issues": historical_issues,
                 "model_history_issues": list(self._model_fallback_issues),
                 "forecast_grain": self.config.forecast_grain,
@@ -262,6 +277,17 @@ class ForecastRunner:
         if spec["leaf"] not in leaves or (spec["total"] is not None and spec["total"] not in totals):
             raise ValueError(f"Selected candidate is unavailable: {spec_id(spec)}")
         f = reconcile(x, leaves[spec["leaf"]], totals.get(spec["total"]), spec["weight"], self.config)
+        month = f.date.iloc[0].strftime("%Y-%m")
+        if month == self.config.forecast_month and self.target_plan_status()["model_plan_estimated_cells"]:
+            keys = ["date", *self.config.segments]
+            official = self.inputs.plan(month).rename(columns={"plan": "official_plan"})
+            f = f.merge(official, on=keys, how="left", validate="one_to_one")
+            f["model_plan"] = f.plan
+            f["model_plan_cumulative"] = f.plan_cumulative
+            f["plan_estimated"] = f.official_plan.isna()
+            f["plan"] = f.pop("official_plan")
+            f["plan_cumulative"] = f.groupby(list(self.config.segments)).plan.transform(lambda s: s.cumsum(skipna=False))
+            f["plan_month"] = f.groupby(list(self.config.segments)).plan.transform(lambda s: s.sum(skipna=False))
         f["model"] = spec_id(spec)
         return f
 
@@ -354,7 +380,12 @@ class ForecastRunner:
         if self.needs_money_fallback():
             from .fallback import money_forecast
             self.selection = None
-            pred = money_forecast(self.history, self.inputs.plan(self.config.forecast_month), self.config)
+            try:
+                model_plan = self.builder.model_plan(self.history, self.config.forecast_month)
+            except PlanUnavailableError:
+                model_plan = None
+            pred = money_forecast(self.history, self.inputs.plan(self.config.forecast_month), self.config,
+                                  model_plan=model_plan)
             self.status.append({"model": "money_fallback", "status": "available",
                                 "reason": "; ".join(self.target_plan_status()["reasons"])})
             pred["forecast_efficiency_pct"] = 100 * pred.forecast_cumulative / pred.plan_cumulative.where(pred.plan_cumulative.gt(0))
@@ -387,6 +418,9 @@ class ForecastRunner:
         if forecast_path.exists() and forecast_path.read_bytes() != payload:
             raise FileExistsError(f"A different frozen forecast already exists in {out}; choose a new output_dir")
         forecast_path.write_bytes(payload)
+        if "model_plan" in pred:
+            pred[["date", *c.segments, "plan", "model_plan", "model_plan_cumulative", "plan_estimated"]].to_csv(
+                out / "model_plan_estimates.csv", index=False, encoding="utf-8-sig")
         upload.to_csv(out / "forecast_upload.csv", index=False, encoding="utf-8-sig", date_format="%Y-%m-%d")
         aggregate_database_upload(upload).to_csv(out / "forecast_upload_total.csv", index=False, encoding="utf-8-sig", date_format="%Y-%m-%d")
         legacy_dashboard_upload(upload).to_csv(out / f"forecast_{c.forecast_month}.csv", index=False, encoding="utf-8-sig", date_format="%Y-%m-%d")

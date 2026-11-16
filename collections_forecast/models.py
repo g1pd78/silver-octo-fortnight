@@ -132,6 +132,39 @@ def calendar_design(frame):
     return np.column_stack(columns)
 
 
+def plan_execution_forecast(history, features, config):
+    """Known/model plan times recent completed months' execution, never target actuals."""
+    dims = list(config.segments)
+    month = features.date.iloc[0].strftime("%Y-%m")
+    h = daily_actual(raw_asof(history, config, origin(month)), config)
+
+    def rate(part):
+        ratios = []
+        for previous, rows in part.groupby(part.date.dt.to_period("M"), sort=True):
+            rows = rows.groupby("date", as_index=False)[["fact", "raw_plan"]].agg(lambda s: s.sum(skipna=False))
+            rows = rows.sort_values("date")
+            if (not pd.DatetimeIndex(rows.date).equals(days(str(previous)))
+                    or rows[["fact", "raw_plan"]].isna().any().any() or rows.raw_plan.sum() <= 0):
+                continue
+            value = rows.fact.sum() / rows.raw_plan.sum()
+            if np.isfinite(value) and value >= 0:
+                ratios.append(value)
+        return float(np.median(ratios[-config.reference_months:])) if ratios else None
+
+    global_rate = rate(h)
+    if global_rate is None:
+        raise ModelHistoryUnavailableError("No completed history with known plan for execution baseline")
+    prediction = pd.Series(index=features.index, dtype=float)
+    for values, group in features.groupby(dims, sort=False):
+        values = values if isinstance(values, tuple) else (values,)
+        part = h
+        for dim, value in zip(dims, values):
+            part = part[part[dim].eq(value)]
+        local_rate = rate(part)
+        prediction.loc[group.index] = group.plan_cumulative * (global_rate if local_rate is None else local_rate)
+    return prediction.to_numpy()
+
+
 def calendar_regression(train, future):
     matrix, target = calendar_design(train), train.fact.to_numpy() / train.plan_month.clip(lower=1).to_numpy()
     ridge = np.eye(matrix.shape[1]) * 10.0
@@ -145,12 +178,24 @@ def _matrix(frame, columns):
     return frame[columns].copy()
 
 
+def catboost_prediction(model, train, target, future, **fit_options):
+    values = np.asarray(target, dtype=float)
+    if len(values) and np.allclose(values, values[0], rtol=1e-12, atol=1e-14):
+        # No split can improve an actually constant response. Some CatBoost
+        # bootstraps still fail here even with allow_const_label enabled.
+        return np.full(len(future), float(values.mean()))
+    model.fit(train, target, **fit_options)
+    return model.predict(future)
+
+
 def candidates(history, month, config, builder):
     x = builder.build(history, month)
     total_x = builder.total(x)
     leaves, totals, status = {}, {}, []
     leaves["reference_profile"] = profile_forecast(history, x, config)
     leaves["calendar_profile"] = profile_forecast(history, x, config, calendar=True, builder=builder)
+    leaves["plan_baseline"] = x.plan_cumulative.to_numpy()
+    leaves["plan_execution"] = plan_execution_forecast(history, x, config)
     if builder.inputs.reference is not None:
         ext = builder.inputs.vintage(builder.inputs.reference, month, ["forecast_daily"], ["date"])
         joined = x[["date", *config.segments]].merge(ext, on=["date", *config.segments], how="left", validate="one_to_one")
@@ -180,21 +225,24 @@ def candidates(history, month, config, builder):
             for depth in config.catboost_depths:
                 params = dict(iterations=config.catboost_iterations, depth=depth, learning_rate=0.05,
                               l2_leaf_reg=10, loss_function="RMSE", random_seed=config.seed,
-                              thread_count=1, verbose=False, allow_writing_files=False)
+                              thread_count=1, verbose=False, allow_writing_files=False,
+                              allow_const_label=True)
                 for mode, target in [("daily", "fact"), ("cumulative", "fact_cumulative")]:
                     name = f"catboost_{mode}_d{depth}"
                     model = CatBoostRegressor(**params)
                     # Equalize monthly monetary scales without deriving any target-month features.
                     scale = train.plan_month.clip(lower=1.0)
-                    model.fit(_matrix(train, cols), train[target] / scale, cat_features=list(config.segments))
-                    pred = model.predict(_matrix(x, cols)) * x.plan_month.clip(lower=1.0).to_numpy()
+                    pred = catboost_prediction(model, _matrix(train, cols), train[target] / scale,
+                                               _matrix(x, cols), cat_features=list(config.segments))
+                    pred = pred * x.plan_month.clip(lower=1.0).to_numpy()
                     if mode == "daily":
                         pred = pd.Series(pred).groupby([x[c] for c in config.segments]).cumsum().to_numpy()
                     leaves[name] = pred
                 valid = train_total.efficiency.notna()
                 model = CatBoostRegressor(**params)
-                model.fit(_matrix(train_total.loc[valid], total_cols), train_total.loc[valid, "efficiency"])
-                totals[f"total_catboost_d{depth}"] = model.predict(_matrix(total_x, total_cols)) * total_x.plan_cumulative.to_numpy()
+                pred = catboost_prediction(model, _matrix(train_total.loc[valid], total_cols),
+                                          train_total.loc[valid, "efficiency"], _matrix(total_x, total_cols))
+                totals[f"total_catboost_d{depth}"] = pred * total_x.plan_cumulative.to_numpy()
     if config.enable_sarimax:
         try:
             totals["total_sarimax"] = sarimax_forecast(history, total_x, month, config, builder)

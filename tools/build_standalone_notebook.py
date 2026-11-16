@@ -96,9 +96,16 @@ pvr_bucket, terbank, inflow`. История содержит `fact` или `w1,
 а не останавливает запуск. Непроверенные месяцы перечислены в `historical_plan_issues` и `fold_log.csv`.
 Известный план целевого месяца сохраняется в CSV; неизвестный остаётся NULL. Точность 1 п.п. в этом режиме не подтверждена.
 При нехватке обучающих/референсных месяцев денежный прогноз также сохраняется; подробности — в `model_history_issues`.
+Если отсутствует только хвост плана после известных дней, `estimate_plan_tail=True` сохраняет подбор моделей:
+для их входов хвост оценивается по исторической форме плана с привязкой к последней известной сумме.
+В CSV для БД этот план остаётся NULL; модельные оценки сохраняются отдельно в `model_plan_estimates.csv`.
+Количество оценённых ячеек — `model_plan_estimated_cells`, ограничения — `warnings` в `plan_status`.
+В подборе участвуют также `plan_baseline` (прогноз = план) и `plan_execution` (план × историческое выполнение).
+Если историческая проверка недоступна, резервный `fallback_plan_execution` использует известный/модельный план
+и историческое выполнение, когда эти данные доступны. Это не подтверждённый на контроле выбор модели.
 При ошибке входа полный текст сохраняется в `input_error.txt` в каталоге результатов.
 """)]
-    for name in ["config", "data", "features", "models", "fallback", "export", "pipeline", "reporting", "demo"]:
+    for name in ["config", "data", "plan_completion", "features", "models", "fallback", "export", "pipeline", "reporting", "demo"]:
         cells.append(nbformat.v4.new_markdown_cell(f"## {name}"))
         cells.append(nbformat.v4.new_code_cell(inline((ROOT / "collections_forecast" / f"{name}.py").read_text(encoding="utf-8"))))
     cells += [nbformat.v4.new_markdown_cell("## Настройки и запуск"), nbformat.v4.new_code_cell('''DEMO = False
@@ -120,6 +127,7 @@ else:
         forecast_grain="total",    # общий KPI; полный снимок портфеля на каждую дату
         fact_mode="cumulative",    # RR: w1 - w2 - cession - write_off — сбор НА ДАТУ
         plan_mode="cumulative",    # RR: target — план НА ДАТУ
+        estimate_plan_tail=True,   # недостающий хвост — оценка только для модели, не официальный план
         output_dir="outputs/forecast_rr_fixed",
     )
     # df = ваш_коннектор(...)  # date, fact, plan; включая известный будущий план
